@@ -1,8 +1,8 @@
 import os
 import logging
 import requests
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import requests
+from database import DatabasePool, get_db_connection
 from flask import Flask, request
 from openai import OpenAI
 
@@ -28,46 +28,23 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ---------------------------------------------
-# Функция инициализации базы
+# Инициализация базы данных (через database.py)
 # ---------------------------------------------
-def init_db():
-    try:
-        conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
-        cur = conn.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS chat_history (
-                id BIGSERIAL PRIMARY KEY,
-                chat_id BIGINT NOT NULL,
-                role VARCHAR(16) NOT NULL CHECK (role IN ('user','assistant','system')),
-                content TEXT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
-        """)
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS chat_history_chat_created_idx
-            ON chat_history (chat_id, created_at DESC);
-        """)
-        conn.commit()
-        cur.close()
-        conn.close()
-        logger.info("База инициализирована успешно ✅")
-    except Exception as e:
-        logger.error(f"Ошибка при инициализации базы: {e}")
+# init_db теперь в отдельном файле init_db.py или вызывается отдельно
+
 
 # ---------------------------------------------
 # Сохранение сообщения в БД
 # ---------------------------------------------
 def save_message(chat_id, role, content):
     try:
-        conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO chat_history (chat_id, role, content) VALUES (%s, %s, %s)",
-            (chat_id, role, content)
-        )
-        conn.commit()
-        cur.close()
-        conn.close()
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO chat_history (chat_id, role, content) VALUES (%s, %s, %s)",
+                    (chat_id, role, content)
+                )
+                conn.commit()
     except Exception as e:
         logger.error(f"Ошибка сохранения сообщения: {e}")
 
@@ -76,15 +53,13 @@ def save_message(chat_id, role, content):
 # ---------------------------------------------
 def load_history(chat_id, limit=20):
     try:
-        conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT role, content FROM chat_history WHERE chat_id = %s ORDER BY created_at DESC LIMIT %s",
-            (chat_id, limit)
-        )
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT role, content FROM chat_history WHERE chat_id = %s ORDER BY created_at DESC LIMIT %s",
+                    (chat_id, limit)
+                )
+                rows = cur.fetchall()
         return list(reversed(rows))  # от старых к новым
     except Exception as e:
         logger.error(f"Ошибка загрузки истории: {e}")
@@ -196,4 +171,5 @@ def send_message(chat_id, text):
 # Точка входа
 # ---------------------------------------------
 if __name__ == "__main__":
+    DatabasePool.initialize()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
