@@ -1,7 +1,8 @@
 import os
 import logging
 import requests
-import requests
+import json
+
 from database import DatabasePool, get_db_connection
 from flask import Flask, request
 from openai import OpenAI
@@ -84,7 +85,7 @@ def tavily_search(query):
         return None
 
 # ---------------------------------------------
-# Генерация ответа через OpenAI
+# Генерация ответа через OpenAI с использованием Tool Calling
 # ---------------------------------------------
 def generate_answer(chat_id, user_message):
     # Загружаем историю
@@ -96,7 +97,7 @@ def generate_answer(chat_id, user_message):
 
 Правила ответов:
 1. Отвечай кратко и структурировано (3–5 предложений).
-2. Излагай только проверенные факты. Если есть сомнение → используй поиск.
+2. Излагай только проверенные факты. Если не знаешь ответа или нужна актуальная информация — ИСПОЛЬЗУЙ ПОИСК (tavily_search).
 3. Избегай двусмысленных формулировок. Пиши так, чтобы ответ был однозначным.
 4. Если вопрос связан с законодательством, указывай источник информации.
 5. Если вопрос выходит за рамки миграции — отвечай вежливо и перенаправляй."""
@@ -107,19 +108,71 @@ def generate_answer(chat_id, user_message):
 
     messages.append({"role": "user", "content": user_message})
 
-    # Попробуем поискать в Tavily
-    tavily_info = tavily_search(user_message)
-    if tavily_info:
-        messages.append({"role": "system", "content": f"Актуальная информация из поиска:\n{tavily_info}"})
+    # Определение инструментов (Tools)
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "tavily_search",
+                "description": "Поиск актуальной информации в интернете. Используй это, когда пользователь спрашивает о новостях, законах, фактах или событиях, которые могли измениться.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Поисковый запрос, например 'новые правила виз США 2024'",
+                        },
+                    },
+                    "required": ["query"],
+                },
+            },
+        }
+    ]
 
     try:
+        # Первый запрос к OpenAI (может вернуть tool_calls)
         response = client.chat.completions.create(
-            model="gpt-4.1",
+            model="gpt-4.1", # Убедитесь, что модель поддерживает tools (gpt-4-turbo, gpt-4o, gpt-3.5-turbo-0125)
             messages=messages,
+            tools=tools,
+            tool_choice="auto",
             max_completion_tokens=800
         )
-        answer = response.choices[0].message.content.strip()
-        return answer
+        
+        response_message = response.choices[0].message
+        tool_calls = response_message.tool_calls
+
+        # Если модель решила использовать инструменты
+        if tool_calls:
+            # Добавляем ответ модели (с запросом инструмента) в историю
+            messages.append(response_message)
+
+            for tool_call in tool_calls:
+                function_name = tool_call.function.name
+                function_args = json.loads(tool_call.function.arguments)
+                
+                if function_name == "tavily_search":
+                    logger.info(f"Выполняется поиск Tavily: {function_args.get('query')}")
+                    search_result = tavily_search(function_args.get("query"))
+                    
+                    messages.append({
+                        "tool_call_id": tool_call.id,
+                        "role": "tool",
+                        "name": function_name,
+                        "content": search_result if search_result else "Ничего не найдено."
+                    })
+
+            # Второй запрос к OpenAI (уже с результатами поиска)
+            second_response = client.chat.completions.create(
+                model="gpt-4.1",
+                messages=messages,
+                max_completion_tokens=800
+            )
+            return second_response.choices[0].message.content.strip()
+        
+        # Если инструменты не понадобились
+        return response_message.content.strip()
+
     except Exception as e:
         logger.error(f"Ошибка OpenAI: {e}")
         return "Извините, я не смог сгенерировать ответ."
