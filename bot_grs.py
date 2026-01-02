@@ -172,12 +172,15 @@ def generate_answer(chat_id, user_message, lang="ru"):
 
     except Exception as e:
         logger.error(f"Error OpenAI (Search Preview): {e}")
-        # Fallback на обычную модель если preview недоступна
-        try:
-             fb = client.chat.completions.create(model="gpt-4o", messages=messages)
-             return fb.choices[0].message.content.strip()
-        except:
-             return TEXTS[lang]["error"]
+        # DEBUG: Отправляем ошибку пользователю, чтобы понять причину на сервере
+        return f"debug_error: {str(e)}"
+        
+        # Fallback (отключен для отладки)
+        # try:
+        #      fb = client.chat.completions.create(model="gpt-4o", messages=messages)
+        #      return fb.choices[0].message.content.strip()
+        # except:
+        #      return TEXTS[lang]["error"]
 
 # ---------------------------------------------
 # Отправка сообщений (с клавиатурой)
