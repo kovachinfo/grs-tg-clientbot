@@ -161,23 +161,23 @@ def generate_answer(chat_id, user_message, lang="ru"):
         messages.append({"role": row["role"], "content": row["content"]})
     messages.append({"role": "user", "content": user_message})
 
-    tools = [{"type": "web_search", "web_search": {"search_depth": "basic"}}]
-
+    # В preview-моделях поиск работает нативно (implicit), без явного указания tools
+    # Model: gpt-4o-mini-search-preview
     try:
-        response = client.responses.create(
-            model="gpt-4o",
-            messages=messages,
-            tools=tools
+        response = client.chat.completions.create(
+            model="gpt-4o-mini-search-preview",
+            messages=messages
         )
-        return response.output_text
+        return response.choices[0].message.content.strip()
+
     except Exception as e:
-        logger.error(f"OpenAI Error: {e}")
-        # Fallback
+        logger.error(f"Error OpenAI (Search Preview): {e}")
+        # Fallback на обычную модель если preview недоступна
         try:
-            fb = client.chat.completions.create(model="gpt-4o", messages=messages)
-            return fb.choices[0].message.content.strip()
+             fb = client.chat.completions.create(model="gpt-4o", messages=messages)
+             return fb.choices[0].message.content.strip()
         except:
-            return TEXTS[lang]["error"]
+             return TEXTS[lang]["error"]
 
 # ---------------------------------------------
 # Отправка сообщений (с клавиатурой)
