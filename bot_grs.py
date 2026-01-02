@@ -101,21 +101,31 @@ def generate_answer(chat_id, user_message):
     ]
 
     try:
-        # Запрос к OpenAI
-        response = client.chat.completions.create(
+        # Используем Responses API для поддержки native web search
+        # Документация: https://platform.openai.com/docs/guides/tools-web-search
+        response = client.responses.create(
             model="gpt-4o",
             messages=messages,
             tools=tools,
-            # tool_choice="auto" — по умолчанию
         )
         
-        # В случае нативного поиска, модель сама вернет итоговый ответ
-        # содержащий информацию из поиска. Дополнительных шагов не требуется.
-        return response.choices[0].message.content.strip()
+        # Получаем текст ответа (в Responses API это обычно output_text)
+        # Если API вернёт другой объект, мы увидим ошибку в логах
+        return response.output_text
 
     except Exception as e:
-        logger.error(f"Ошибка OpenAI: {e}")
-        return "Извините, я не смог сгенерировать ответ из-за ошибки сервиса."
+        logger.error(f"Ошибка OpenAI (Responses API): {e}")
+        # Fallback: Если Responses API недотупен, пробуем старый метод без поиска
+        try:
+            logger.info("Попытка fallback на chat.completions (без поиска)")
+            fallback_response = client.chat.completions.create(
+                model="gpt-4o",
+                messages=messages
+            )
+            return fallback_response.choices[0].message.content.strip() + "\n(Поиск в интернете был недоступен)"
+        except Exception as e2:
+            logger.error(f"Ошибка Fallback: {e2}")
+            return "Извините, я не смог сгенерировать ответ из-за ошибки сервиса."
 
 # ---------------------------------------------
 # Telegram webhook (с учётом reply_to_message)
