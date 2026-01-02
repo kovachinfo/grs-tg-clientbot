@@ -2,10 +2,14 @@ import os
 import logging
 import requests
 import json
+import time
 
 from database import DatabasePool, get_db_connection
 from flask import Flask, request
 from openai import OpenAI
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ---------------------------------------------
 # Логирование
@@ -23,20 +27,96 @@ app = Flask(__name__)
 # ---------------------------------------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ---------------------------------------------
-# Инициализация базы данных (через database.py)
+# Тексты и настройки
 # ---------------------------------------------
-# init_db теперь в отдельном файле init_db.py или вызывается отдельно
+MAX_FREE_REQUESTS = 25
 
+TEXTS = {
+    "ru": {
+        "welcome": "Добро пожаловать в GRS Bot! 🌍\nПожалуйста, выберите язык:",
+        "menu_title": "Главное меню:",
+        "btn_news": "📰 Свежие новости",
+        "btn_contact": "📝 Написать менеджеру",
+        "btn_limit": "📊 Проверить лимит",
+        "news_prompt": "Найди последние новости миграционного законодательства для россиян на 2025 год и кратко расскажи.",
+        "contact_info": "Связаться с менеджером: @manager_username",
+        "limit_info": "Использовано запросов: {count} из {max}.",
+        "limit_reached": "🚫 Вы исчерпали лимит бесплатных запросов ({max}).\nПожалуйста, свяжитесь с менеджером для консультации: @manager_username",
+        "lang_selected": "🇷🇺 Язык установлен: Русский",
+        "searching": "🔍 Ищу информацию, это может занять минуту...",
+        "error": "❌ Произошла ошибка сервиса.",
+        "btn_ru": "🇷🇺 Русский",
+        "btn_en": "🇬🇧 English"
+    },
+    "en": {
+        "welcome": "Welcome to GRS Bot! 🌍\nPlease select your language:",
+        "menu_title": "Main menu:",
+        "btn_news": "📰 Latest News",
+        "btn_contact": "📝 Contact Manager",
+        "btn_limit": "📊 Check Limit",
+        "news_prompt": "Find the latest migration news for 2025 and summarize them.",
+        "contact_info": "Contact Manager: @manager_username",
+        "limit_info": "Requests used: {count} of {max}.",
+        "limit_reached": "🚫 You have reached the free request limit ({max}).\nPlease contact the manager: @manager_username",
+        "lang_selected": "🇬🇧 Language set: English",
+        "searching": "🔍 Searching...",
+        "error": "❌ Service error.",
+        "btn_ru": "🇷🇺 Русский",
+        "btn_en": "🇬🇧 English"
+    }
+}
 
 # ---------------------------------------------
-# Сохранение сообщения в БД
+# Функции работы с пользователями (БД)
 # ---------------------------------------------
+def get_user(chat_id):
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM users WHERE chat_id = %s", (chat_id,))
+                return cur.fetchone()
+    except Exception as e:
+        logger.error(f"Error getting user: {e}")
+        return None
+
+def create_user(chat_id):
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO users (chat_id, language_code, request_count) VALUES (%s, 'ru', 0) ON CONFLICT (chat_id) DO NOTHING",
+                    (chat_id,)
+                )
+                conn.commit()
+        return get_user(chat_id)
+    except Exception as e:
+        logger.error(f"Error creating user: {e}")
+        return None
+
+def update_user_language(chat_id, lang_code):
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE users SET language_code = %s WHERE chat_id = %s", (lang_code, chat_id))
+                conn.commit()
+    except Exception as e:
+        logger.error(f"Error updating language: {e}")
+
+def increment_request_count(chat_id):
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE users SET request_count = request_count + 1 WHERE chat_id = %s", (chat_id,))
+                conn.commit()
+    except Exception as e:
+        logger.error(f"Error incrementing count: {e}")
+
+# Функции работы с историей сообщений (сохранены)
 def save_message(chat_id, role, content):
     try:
         with get_db_connection() as conn:
@@ -47,11 +127,8 @@ def save_message(chat_id, role, content):
                 )
                 conn.commit()
     except Exception as e:
-        logger.error(f"Ошибка сохранения сообщения: {e}")
+        logger.error(f"Error saving message: {e}")
 
-# ---------------------------------------------
-# Загрузка последних сообщений из БД
-# ---------------------------------------------
 def load_history(chat_id, limit=20):
     try:
         with get_db_connection() as conn:
@@ -61,118 +138,167 @@ def load_history(chat_id, limit=20):
                     (chat_id, limit)
                 )
                 rows = cur.fetchall()
-        return list(reversed(rows))  # от старых к новым
+        return list(reversed(rows))
     except Exception as e:
-        logger.error(f"Ошибка загрузки истории: {e}")
+        logger.error(f"Error loading history: {e}")
         return []
 
 # ---------------------------------------------
-# Генерация ответа через OpenAI с использованием Native Web Search
+# Генерация ответа (Native Search)
 # ---------------------------------------------
-def generate_answer(chat_id, user_message):
-    # Загружаем историю
+def generate_answer(chat_id, user_message, lang="ru"):
     history = load_history(chat_id)
 
-    # Формируем список сообщений
-    messages = [{"role": "system", "content": (
-        """Ты — миграционный консультант компании Global Relocation Solutions.
+    system_prompt = """Ты — миграционный консультант компании Global Relocation Solutions.
+Правила:
+1. Отвечай кратко (3–5 предложений).
+2. Используй ПОИСК (web_search) для актуальных данных.
+3. Язык ответа: {language}.
+""".format(language="Русский" if lang == "ru" else "English")
 
-Правила ответов:
-1. Отвечай кратко и структурировано (3–5 предложений).
-2. Излагай только проверенные факты. ИСПОЛЬЗУЙ ПОИСК (web_search), если не знаешь актуального ответа или факты могли измениться.
-3. Избегай двусмысленных формулировок. Пиши так, чтобы ответ был однозначным.
-4. Если вопрос связан с законодательством, указывай источник информации.
-5. Если вопрос выходит за рамки миграции — отвечай вежливо и перенаправляй."""
-    )}]
-
+    messages = [{"role": "system", "content": system_prompt}]
     for row in history:
         messages.append({"role": row["role"], "content": row["content"]})
-
     messages.append({"role": "user", "content": user_message})
 
-    # Определение инструментов (Native Web Search)
-    tools = [
-        {
-            "type": "web_search",
-            "web_search": {
-                "search_depth": "basic" # или "deep" если нужно, но оставим базовый
-            }
-        }
-    ]
+    tools = [{"type": "web_search", "web_search": {"search_depth": "basic"}}]
 
     try:
-        # Используем Responses API для поддержки native web search
-        # Документация: https://platform.openai.com/docs/guides/tools-web-search
         response = client.responses.create(
             model="gpt-4o",
             messages=messages,
-            tools=tools,
+            tools=tools
         )
-        
-        # Получаем текст ответа (в Responses API это обычно output_text)
-        # Если API вернёт другой объект, мы увидим ошибку в логах
         return response.output_text
-
     except Exception as e:
-        logger.error(f"Ошибка OpenAI (Responses API): {e}")
-        # Fallback: Если Responses API недотупен, пробуем старый метод без поиска
+        logger.error(f"OpenAI Error: {e}")
+        # Fallback
         try:
-            logger.info("Попытка fallback на chat.completions (без поиска)")
-            fallback_response = client.chat.completions.create(
-                model="gpt-4o",
-                messages=messages
-            )
-            return fallback_response.choices[0].message.content.strip() + "\n(Поиск в интернете был недоступен)"
-        except Exception as e2:
-            logger.error(f"Ошибка Fallback: {e2}")
-            return "Извините, я не смог сгенерировать ответ из-за ошибки сервиса."
+            fb = client.chat.completions.create(model="gpt-4o", messages=messages)
+            return fb.choices[0].message.content.strip()
+        except:
+            return TEXTS[lang]["error"]
 
 # ---------------------------------------------
-# Telegram webhook (с учётом reply_to_message)
+# Отправка сообщений (с клавиатурой)
+# ---------------------------------------------
+def send_message(chat_id, text, keyboard=None):
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+        
+        if keyboard:
+            payload["reply_markup"] = json.dumps(keyboard)
+            
+        requests.post(url, json=payload)
+    except Exception as e:
+        logger.error(f"Send Error: {e}")
+
+def get_main_keyboard(lang):
+    t = TEXTS[lang]
+    return {
+        "keyboard": [
+            [{"text": t["btn_news"]}, {"text": t["btn_contact"]}],
+            [{"text": t["btn_limit"]}]
+        ],
+        "resize_keyboard": True
+    }
+
+def get_lang_keyboard():
+    return {
+        "keyboard": [
+            [{"text": TEXTS["ru"]["btn_ru"]}, {"text": TEXTS["en"]["btn_en"]}]
+        ],
+        "resize_keyboard": True,
+        "one_time_keyboard": True
+    }
+
+# ---------------------------------------------
+# Webhook
 # ---------------------------------------------
 @app.route(f"/webhook/{TELEGRAM_TOKEN}", methods=["POST"])
 def webhook():
     data = request.get_json()
-    logger.info(f"Update: {data}")
+    if not data or "message" not in data:
+        return "ok"
 
-    if "message" in data and "text" in data["message"]:
-        chat_id = data["message"]["chat"]["id"]
-        user_message = data["message"]["text"]
+    msg = data["message"]
+    chat_id = msg.get("chat", {}).get("id")
+    text = msg.get("text", "")
 
-        # Проверяем, было ли это reply на другое сообщение
-        if "reply_to_message" in data["message"]:
-            original_text = data["message"]["reply_to_message"].get("text", "")
-            if original_text:
-                user_message = f"(Ответ на сообщение: '{original_text}') {user_message}"
+    if not chat_id or not text:
+        return "ok"
 
-        # Сохраняем сообщение пользователя
-        save_message(chat_id, "user", user_message)
+    # 1. Получаем/Создаем пользователя
+    user = get_user(chat_id)
+    if not user:
+        user = create_user(chat_id)
+        # Если новый пользователь - просим выбрать язык
+        send_message(chat_id, TEXTS["ru"]["welcome"], get_lang_keyboard())
+        return "ok"
 
-        # Генерируем ответ
-        answer = generate_answer(chat_id, user_message)
+    lang = user.get("language_code", "ru")
+    if lang not in ["ru", "en"]: lang = "ru" # fallback
 
-        # Сохраняем ответ ассистента
-        save_message(chat_id, "assistant", answer)
+    # 2. Обработка команд и кнопок
+    if text == "/start":
+        send_message(chat_id, TEXTS[lang]["welcome"], get_lang_keyboard())
+        return "ok"
 
-        # Отправляем ответ в Telegram
-        send_message(chat_id, answer)
+    # Смена языка
+    if text == TEXTS["ru"]["btn_ru"] or text == "🇷🇺 Русский":
+        update_user_language(chat_id, "ru")
+        send_message(chat_id, TEXTS["ru"]["lang_selected"], get_main_keyboard("ru"))
+        return "ok"
+    
+    if text == TEXTS["en"]["btn_en"] or text == "🇬🇧 English":
+        update_user_language(chat_id, "en")
+        send_message(chat_id, TEXTS["en"]["lang_selected"], get_main_keyboard("en"))
+        return "ok"
+
+    # Кнопки меню
+    t = TEXTS[lang]
+    
+    if text == t["btn_contact"]:
+        send_message(chat_id, t["contact_info"])
+        return "ok"
+    
+    if text == t["btn_limit"]:
+        limit_msg = t["limit_info"].format(count=user['request_count'], max=MAX_FREE_REQUESTS)
+        send_message(chat_id, limit_msg)
+        return "ok"
+
+    if text == t["btn_news"]:
+        # Проверяем лимит перед новостями (это тоже запрос)
+        if user['request_count'] >= MAX_FREE_REQUESTS and not user.get('is_premium'):
+            send_message(chat_id, t["limit_reached"])
+            return "ok"
+        
+        send_message(chat_id, t["searching"])
+        increment_request_count(chat_id)
+        ans = generate_answer(chat_id, t["news_prompt"], lang)
+        save_message(chat_id, "user", text) # Сохраняем нажатие кнопки как запрос
+        save_message(chat_id, "assistant", ans)
+        send_message(chat_id, ans)
+        return "ok"
+
+    # 3. Обработка обычного текстового запроса (ChatGPT)
+    
+    # Проверка лимита
+    if user['request_count'] >= MAX_FREE_REQUESTS and not user.get('is_premium'):
+        send_message(chat_id, t["limit_reached"])
+        return "ok"
+
+    increment_request_count(chat_id)
+    save_message(chat_id, "user", text)
+    
+    # Можно отправить "печатает..." или уведомление
+    ans = generate_answer(chat_id, text, lang)
+    save_message(chat_id, "assistant", ans)
+    send_message(chat_id, ans)
 
     return "ok"
-# ---------------------------------------------
-# Функция отправки ответа в Telegram
-# ---------------------------------------------
-def send_message(chat_id, text):
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        payload = {"chat_id": chat_id, "text": text}
-        resp = requests.post(url, json=payload)
-        logger.info(f"Отправлено сообщение длиной {len(text)} символов")
-    except Exception as e:
-        logger.error(f"Ошибка отправки: {e}")
 
-# ---------------------------------------------
-# Точка входа
-# ---------------------------------------------
 if __name__ == "__main__":
     DatabasePool.initialize()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
