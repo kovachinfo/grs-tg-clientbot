@@ -23,7 +23,7 @@ app = Flask(__name__)
 # ---------------------------------------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -67,25 +67,7 @@ def load_history(chat_id, limit=20):
         return []
 
 # ---------------------------------------------
-# Запрос к Tavily API (поиск)
-# ---------------------------------------------
-def tavily_search(query):
-    try:
-        resp = requests.post(
-            "https://api.tavily.com/search",
-            headers={"Authorization": f"Bearer {TAVILY_API_KEY}"},
-            json={"query": query, "num_results": 3}
-        )
-        data = resp.json()
-        if "results" in data:
-            return "\n".join([r["content"] for r in data["results"]])
-        return None
-    except Exception as e:
-        logger.error(f"Tavily error: {e}")
-        return None
-
-# ---------------------------------------------
-# Генерация ответа через OpenAI с использованием Tool Calling
+# Генерация ответа через OpenAI с использованием Native Web Search
 # ---------------------------------------------
 def generate_answer(chat_id, user_message):
     # Загружаем историю
@@ -97,7 +79,7 @@ def generate_answer(chat_id, user_message):
 
 Правила ответов:
 1. Отвечай кратко и структурировано (3–5 предложений).
-2. Излагай только проверенные факты. Если не знаешь ответа или нужна актуальная информация — ИСПОЛЬЗУЙ ПОИСК (tavily_search).
+2. Излагай только проверенные факты. ИСПОЛЬЗУЙ ПОИСК (web_search), если не знаешь актуального ответа или факты могли измениться.
 3. Избегай двусмысленных формулировок. Пиши так, чтобы ответ был однозначным.
 4. Если вопрос связан с законодательством, указывай источник информации.
 5. Если вопрос выходит за рамки миграции — отвечай вежливо и перенаправляй."""
@@ -108,74 +90,32 @@ def generate_answer(chat_id, user_message):
 
     messages.append({"role": "user", "content": user_message})
 
-    # Определение инструментов (Tools)
+    # Определение инструментов (Native Web Search)
     tools = [
         {
-            "type": "function",
-            "function": {
-                "name": "tavily_search",
-                "description": "Поиск актуальной информации в интернете. Используй это, когда пользователь спрашивает о новостях, законах, фактах или событиях, которые могли измениться.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "Поисковый запрос, например 'новые правила виз США 2024'",
-                        },
-                    },
-                    "required": ["query"],
-                },
-            },
+            "type": "web_search",
+            "web_search": {
+                "search_depth": "basic" # или "deep" если нужно, но оставим базовый
+            }
         }
     ]
 
     try:
-        # Первый запрос к OpenAI (может вернуть tool_calls)
+        # Запрос к OpenAI
         response = client.chat.completions.create(
-            model="gpt-4.1", # Убедитесь, что модель поддерживает tools (gpt-4-turbo, gpt-4o, gpt-3.5-turbo-0125)
+            model="gpt-4o",
             messages=messages,
             tools=tools,
-            tool_choice="auto",
-            max_completion_tokens=800
+            # tool_choice="auto" — по умолчанию
         )
         
-        response_message = response.choices[0].message
-        tool_calls = response_message.tool_calls
-
-        # Если модель решила использовать инструменты
-        if tool_calls:
-            # Добавляем ответ модели (с запросом инструмента) в историю
-            messages.append(response_message)
-
-            for tool_call in tool_calls:
-                function_name = tool_call.function.name
-                function_args = json.loads(tool_call.function.arguments)
-                
-                if function_name == "tavily_search":
-                    logger.info(f"Выполняется поиск Tavily: {function_args.get('query')}")
-                    search_result = tavily_search(function_args.get("query"))
-                    
-                    messages.append({
-                        "tool_call_id": tool_call.id,
-                        "role": "tool",
-                        "name": function_name,
-                        "content": search_result if search_result else "Ничего не найдено."
-                    })
-
-            # Второй запрос к OpenAI (уже с результатами поиска)
-            second_response = client.chat.completions.create(
-                model="gpt-4.1",
-                messages=messages,
-                max_completion_tokens=800
-            )
-            return second_response.choices[0].message.content.strip()
-        
-        # Если инструменты не понадобились
-        return response_message.content.strip()
+        # В случае нативного поиска, модель сама вернет итоговый ответ
+        # содержащий информацию из поиска. Дополнительных шагов не требуется.
+        return response.choices[0].message.content.strip()
 
     except Exception as e:
         logger.error(f"Ошибка OpenAI: {e}")
-        return "Извините, я не смог сгенерировать ответ."
+        return "Извините, я не смог сгенерировать ответ из-за ошибки сервиса."
 
 # ---------------------------------------------
 # Telegram webhook (с учётом reply_to_message)
