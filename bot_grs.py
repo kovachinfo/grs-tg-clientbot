@@ -35,6 +35,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # Тексты и настройки
 # ---------------------------------------------
 MAX_FREE_REQUESTS = 25
+MAX_HISTORY_MESSAGES = 10
 
 TEXTS = {
     "ru": {
@@ -50,6 +51,7 @@ TEXTS = {
         "lang_selected": "🇷🇺 Язык установлен: Русский",
         "searching": "🔍 Ищу информацию, это может занять минуту...",
         "error": "❌ Произошла ошибка сервиса.",
+        "rate_limited": "⚠️ Запрос временно недоступен. Попробуйте снова через минуту.",
         "btn_ru": "🇷🇺 Русский",
         "btn_en": "🇬🇧 English"
     },
@@ -66,6 +68,7 @@ TEXTS = {
         "lang_selected": "🇬🇧 Language set: English",
         "searching": "🔍 Searching...",
         "error": "❌ Service error.",
+        "rate_limited": "⚠️ Request is temporarily unavailable. Please try again in a minute.",
         "btn_ru": "🇷🇺 Русский",
         "btn_en": "🇬🇧 English"
     }
@@ -146,8 +149,8 @@ def load_history(chat_id, limit=20):
 # ---------------------------------------------
 # Генерация ответа (Native Search)
 # ---------------------------------------------
-def generate_answer(chat_id, user_message, lang="ru"):
-    history = load_history(chat_id)
+def generate_answer(chat_id, user_message, lang="ru", use_history=True):
+    history = load_history(chat_id, limit=MAX_HISTORY_MESSAGES) if use_history else []
 
     system_prompt = """Ты — миграционный консультант компании Global Relocation Solutions.
 Правила:
@@ -171,16 +174,18 @@ def generate_answer(chat_id, user_message, lang="ru"):
         return response.choices[0].message.content.strip()
 
     except Exception as e:
-        logger.error(f"Error OpenAI (Search Preview): {e}")
-        # DEBUG: Отправляем ошибку пользователю, чтобы понять причину на сервере
-        return f"debug_error: {str(e)}"
-        
-        # Fallback (отключен для отладки)
-        # try:
-        #      fb = client.chat.completions.create(model="gpt-4o", messages=messages)
-        #      return fb.choices[0].message.content.strip()
-        # except:
-        #      return TEXTS[lang]["error"]
+        err_text = str(e)
+        logger.error(f"Error OpenAI (Search Preview): {err_text}")
+
+        # Попытка fallback без поиска, если превысили лимиты
+        try:
+            fb = client.chat.completions.create(model="gpt-4o-mini", messages=messages)
+            return fb.choices[0].message.content.strip()
+        except Exception as fb_err:
+            logger.error(f"Fallback error: {fb_err}")
+            if "rate_limit" in err_text or "token" in err_text.lower():
+                return TEXTS[lang]["rate_limited"]
+            return TEXTS[lang]["error"]
 
 # ---------------------------------------------
 # Отправка сообщений (с клавиатурой)
@@ -286,7 +291,7 @@ def webhook():
         
         # Если нажали русскую кнопку - отвечаем на русском, даже если в БД eng (опционально, но логично)
         # Но пока оставим логику по настройке в БД, чтобы не путать
-        ans = generate_answer(chat_id, t["news_prompt"], lang)
+        ans = generate_answer(chat_id, t["news_prompt"], lang, use_history=False)
         
         save_message(chat_id, "user", text) 
         save_message(chat_id, "assistant", ans)
