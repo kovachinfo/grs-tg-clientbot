@@ -259,19 +259,21 @@ def webhook():
         send_message(chat_id, TEXTS["en"]["lang_selected"], get_main_keyboard("en"))
         return "ok"
 
-    # Кнопки меню
+    # Кнопки меню (проверяем оба языка, чтобы избежать рассинхрона)
     t = TEXTS[lang]
+    ru_t = TEXTS["ru"]
+    en_t = TEXTS["en"]
     
-    if text == t["btn_contact"]:
+    if text in [ru_t["btn_contact"], en_t["btn_contact"]]:
         send_message(chat_id, t["contact_info"])
         return "ok"
     
-    if text == t["btn_limit"]:
+    if text in [ru_t["btn_limit"], en_t["btn_limit"]]:
         limit_msg = t["limit_info"].format(count=user['request_count'], max=MAX_FREE_REQUESTS)
         send_message(chat_id, limit_msg)
         return "ok"
 
-    if text == t["btn_news"]:
+    if text in [ru_t["btn_news"], en_t["btn_news"]]:
         # Проверяем лимит перед новостями (это тоже запрос)
         if user['request_count'] >= MAX_FREE_REQUESTS and not user.get('is_premium'):
             send_message(chat_id, t["limit_reached"])
@@ -279,8 +281,12 @@ def webhook():
         
         send_message(chat_id, t["searching"])
         increment_request_count(chat_id)
+        
+        # Если нажали русскую кнопку - отвечаем на русском, даже если в БД eng (опционально, но логично)
+        # Но пока оставим логику по настройке в БД, чтобы не путать
         ans = generate_answer(chat_id, t["news_prompt"], lang)
-        save_message(chat_id, "user", text) # Сохраняем нажатие кнопки как запрос
+        
+        save_message(chat_id, "user", text) 
         save_message(chat_id, "assistant", ans)
         send_message(chat_id, ans)
         return "ok"
