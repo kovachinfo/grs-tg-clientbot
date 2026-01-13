@@ -40,7 +40,7 @@ TEXTS = {
     "ru": {
         "welcome": "Добро пожаловать в GRS Bot! 🌍\nПожалуйста, выберите язык:",
         "menu_title": "Главное меню:",
-        "btn_news": "📰 Свежие новости",
+        "btn_news": "📰 Актуальные новости",
         "btn_contact": "📝 Написать менеджеру",
         "btn_limit": "📊 Проверить лимит",
         "news_prompt": "Подготовь сводку новостей (6-10 основных) в области миграционного законодательства преимущественно у стран, популярных для релокантов из России как основного направления релокации, а так же в самой России Временной период для выборки новостей - весь 2025 год.",
@@ -188,12 +188,14 @@ def generate_answer(chat_id, user_message, lang="ru"):
 def send_message(chat_id, text, keyboard=None):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+        payload = {"chat_id": chat_id, "text": text}
         
         if keyboard:
             payload["reply_markup"] = json.dumps(keyboard)
-            
-        requests.post(url, json=payload)
+
+        resp = requests.post(url, json=payload)
+        if not resp.ok:
+            logger.error("Send Error: %s %s", resp.status_code, resp.text)
     except Exception as e:
         logger.error(f"Send Error: {e}")
 
