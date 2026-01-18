@@ -406,9 +406,13 @@ def webhook():
     lang = user.get("language_code", "ru")
     if lang not in ["ru", "en"]: lang = "ru" # fallback
 
+    t = TEXTS[lang]
+    ru_t = TEXTS["ru"]
+    en_t = TEXTS["en"]
+
     # 2. Обработка команд и кнопок
     if text == "/start":
-        send_message(chat_id, TEXTS[lang]["welcome"], get_lang_keyboard())
+        send_message(chat_id, t["welcome"], get_lang_keyboard())
         return "ok"
 
     if text == "/refresh_news":
@@ -428,10 +432,6 @@ def webhook():
         return "ok"
 
     # Кнопки меню (проверяем оба языка, чтобы избежать рассинхрона)
-    t = TEXTS[lang]
-    ru_t = TEXTS["ru"]
-    en_t = TEXTS["en"]
-    
     if text in [ru_t["btn_contact"], en_t["btn_contact"]]:
         send_message(chat_id, t["contact_info"])
         return "ok"
