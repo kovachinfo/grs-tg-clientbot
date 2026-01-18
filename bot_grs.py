@@ -30,6 +30,8 @@ app = Flask(__name__)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
+OPENAI_PROMPT_ID = os.getenv("OPENAI_PROMPT_ID", "pmpt_696d0d3de06481978c45ffeb3e8e02cf0bb66848bed5b2a9")
+OPENAI_PROMPT_VERSION = os.getenv("OPENAI_PROMPT_VERSION", "2")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -49,15 +51,18 @@ TEXTS = {
         "btn_limit": "📊 Проверить лимит",
         "news_prompt": (
             "Подготовь сводку новостей (6–10 пунктов) ТОЛЬКО по миграционному праву и политике, "
-            "актуальных для граждан РФ (релоканты: ВНЖ/ПМЖ, визы, гражданство, убежище, "
-            "трудовая/предпринимательская миграция, учеба, цифровые кочевники, репатриация). "
-            "Фокус: страны, популярные у релокантов из России, и Россия. Учитывай санкционные ограничения "
-            "и изменения правил въезда/проживания. "
+            "актуальных для релокантов из России (граждане РФ, проживающие за рубежом или планирующие "
+            "переезд). Темы: визы, ВНЖ/ПМЖ, гражданство, убежище, трудовая/предпринимательская миграция, "
+            "учеба, цифровые кочевники, репатриация, воссоединение семьи. "
+            "Фокус: страны, популярные у релокантов из России, и правила, влияющие на выезд/проживание. "
+            "Исключай новости о внутреннем контроле миграции в РФ, если они не влияют на релокантов. "
             "Период: весь 2025 год. Используй web_search. "
             "Для каждого пункта укажи дату и источник в формате: "
             "\"Источник: Название статьи, домен\" (без прямых ссылок). "
             "Исключай нерелевантные новости (экономика, спорт, криминал и т.п.). "
             "Не используй Wikipedia или вики-источники. "
+            "Формат: нумерованный список в стиле "
+            "\"1) 🧭 Заголовок — дата. Короткое описание. Источник: Название статьи, домен\". "
             "Формат ответа: простой текст без Markdown; можно добавить тематические эмодзи. "
             "Если в 2025 году по теме меньше 6 значимых новостей, дай меньше и укажи это."
         ),
@@ -78,15 +83,18 @@ TEXTS = {
         "btn_contact": "📝 Contact Manager",
         "btn_limit": "📊 Check Limit",
         "news_prompt": (
-            "Prepare a summary (6–10 items) ONLY about migration law and policy relevant to Russian citizens "
-            "(visas, residence permits, citizenship, asylum, labor/business migration, study, digital nomads, "
-            "repatriation). Focus on countries popular with relocators from Russia and Russia itself; "
-            "consider sanctions and entry/residency rule changes. "
+            "Prepare a summary (6–10 items) ONLY about migration law and policy relevant to Russian relocators "
+            "(Russian citizens living abroad or planning to move). Topics: visas, residence permits, "
+            "citizenship, asylum, labor/business migration, study, digital nomads, repatriation, family reunion. "
+            "Focus on countries popular with relocators from Russia and rules affecting exit/residency. "
+            "Exclude internal RF migration-control news unless it affects relocators. "
             "Time period: the whole of 2025. Use web_search. "
             "For each item include date and source in format: "
             "\"Source: Article title, domain\" (no direct links). "
             "Exclude unrelated news (economy, sports, crime, etc.). "
             "Do not use Wikipedia or wiki sources. "
+            "Format: numbered list like "
+            "\"1) 🧭 Title — date. Short description. Source: Article title, domain\". "
             "Answer in plain text, no Markdown; you may add thematic emojis. "
             "If fewer than 6 relevant 2025 items exist, provide fewer and state that."
         ),
@@ -250,22 +258,61 @@ def needs_news_retry(text):
         return True
     return False
 
+def escape_html(text):
+    if text is None:
+        return ""
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+def bold_title(item_text):
+    for delim in [" — ", " - ", " —", " -"]:
+        if delim in item_text:
+            title, rest = item_text.split(delim, 1)
+            return f"<b>{title.strip()}</b>{delim}{rest.strip()}"
+    if ":" in item_text:
+        title, rest = item_text.split(":", 1)
+        return f"<b>{title.strip()}</b>: {rest.strip()}"
+    return f"<b>{item_text.strip()}</b>"
+
+def format_news_html(text, lang):
+    header = (
+        "🧭 <b>Новости для релокантов из России</b>"
+        if lang == "ru"
+        else "🧭 <b>News for Russian Relocators</b>"
+    )
+    if not text:
+        return header
+
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    items = []
+    current = []
+    for ln in lines:
+        if re.match(r"^\\d+[\\).]\\s+", ln):
+            if current:
+                items.append(" ".join(current))
+                current = []
+        current.append(ln)
+    if current:
+        items.append(" ".join(current))
+
+    formatted = []
+    for raw in items:
+        escaped = escape_html(raw)
+        formatted.append(bold_title(escaped))
+
+    body = "\n".join(formatted) if formatted else escape_html(text)
+    return f"{header}\n\n{body}".strip()
+
 # ---------------------------------------------
 # Генерация ответа (Native Search)
 # ---------------------------------------------
 def generate_answer(chat_id, user_message, lang="ru", use_history=True, news_mode=False):
     history = load_history(chat_id, limit=MAX_HISTORY_MESSAGES) if use_history else []
 
-    system_prompt = """Ты — миграционный консультант компании Global Relocation Solutions.
-Правила:
-1. Отвечай кратко (3–5 предложений).
-2. Используй ПОИСК (web_search) для актуальных данных.
-3. Язык ответа: {language}.
-""".format(language="Русский" if lang == "ru" else "English")
-    if news_mode:
-        system_prompt += "\n4. Формат ответа: простой текст без Markdown."
-
-    messages = [{"role": "system", "content": system_prompt}]
+    messages = []
     for row in history:
         messages.append({"role": row["role"], "content": row["content"]})
     messages.append({"role": "user", "content": user_message})
@@ -273,11 +320,15 @@ def generate_answer(chat_id, user_message, lang="ru", use_history=True, news_mod
     # В preview-моделях поиск работает нативно (implicit), без явного указания tools
     # Model: gpt-4o-mini-search-preview
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini-search-preview",
-            messages=messages
+        response = client.responses.create(
+            prompt={
+                "id": OPENAI_PROMPT_ID,
+                "version": OPENAI_PROMPT_VERSION
+            },
+            input=messages,
+            max_output_tokens=2048
         )
-        content = response.choices[0].message.content.strip()
+        content = (response.output_text or "").strip()
         content_l = content.lower()
 
         if (
@@ -287,30 +338,37 @@ def generate_answer(chat_id, user_message, lang="ru", use_history=True, news_mod
             or "do not have access" in content_l
         ):
             retry_rule = (
-                "4. Обязательно используй web_search и не сообщай об ограничениях доступа."
+                "Пожалуйста, используй web_search и не упоминай ограничения доступа."
                 if lang == "ru"
-                else "4. You must use web_search and do not mention access limitations."
+                else "Please use web_search and do not mention access limitations."
             )
-            retry_prompt = system_prompt + "\n" + retry_rule
-            messages[0]["content"] = retry_prompt
-            retry = client.chat.completions.create(
-                model="gpt-4o-mini-search-preview",
-                messages=messages
+            retry_messages = messages + [{"role": "user", "content": retry_rule}]
+            retry = client.responses.create(
+                prompt={
+                    "id": OPENAI_PROMPT_ID,
+                    "version": OPENAI_PROMPT_VERSION
+                },
+                input=retry_messages,
+                max_output_tokens=2048
             )
-            return retry.choices[0].message.content.strip()
+            return (retry.output_text or "").strip()
 
         if news_mode and needs_news_retry(content):
             retry_rule = (
-                "5. Не используй Wikipedia/вики-источники и дай только миграционные новости."
+                "Не используй Wikipedia/вики-источники и дай только новости для релокантов из РФ."
                 if lang == "ru"
-                else "5. Do not use Wikipedia/wiki sources and only provide migration-related news."
+                else "Do not use Wikipedia/wiki sources and only provide news for Russian relocators."
             )
-            messages[0]["content"] = system_prompt + "\n" + retry_rule
-            retry = client.chat.completions.create(
-                model="gpt-4o-mini-search-preview",
-                messages=messages
+            retry_messages = messages + [{"role": "user", "content": retry_rule}]
+            retry = client.responses.create(
+                prompt={
+                    "id": OPENAI_PROMPT_ID,
+                    "version": OPENAI_PROMPT_VERSION
+                },
+                input=retry_messages,
+                max_output_tokens=2048
             )
-            content = retry.choices[0].message.content.strip()
+            content = (retry.output_text or "").strip()
 
         return sanitize_plain_text(content) if news_mode else content
 
@@ -320,8 +378,11 @@ def generate_answer(chat_id, user_message, lang="ru", use_history=True, news_mod
 
         # Попытка fallback без поиска, если превысили лимиты
         try:
-            fb = client.chat.completions.create(model="gpt-4o-mini", messages=messages)
-            return fb.choices[0].message.content.strip()
+            fb = client.responses.create(
+                input=messages,
+                max_output_tokens=1024
+            )
+            return (fb.output_text or "").strip()
         except Exception as fb_err:
             logger.error(f"Fallback error: {fb_err}")
             if "rate_limit" in err_text or "token" in err_text.lower():
@@ -331,13 +392,15 @@ def generate_answer(chat_id, user_message, lang="ru", use_history=True, news_mod
 # ---------------------------------------------
 # Отправка сообщений (с клавиатурой)
 # ---------------------------------------------
-def send_message(chat_id, text, keyboard=None):
+def send_message(chat_id, text, keyboard=None, parse_mode=None):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         payload = {"chat_id": chat_id, "text": text}
-        
+
         if keyboard:
             payload["reply_markup"] = json.dumps(keyboard)
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
 
         resp = requests.post(url, json=payload)
         if not resp.ok:
@@ -466,14 +529,15 @@ def webhook():
             else:
                 # Если нажали русскую кнопку - отвечаем на русском, даже если в БД eng (опционально, но логично)
                 # Но пока оставим логику по настройке в БД, чтобы не путать
-                ans = generate_answer(chat_id, t["news_prompt"], lang, use_history=False, news_mode=True)
+                raw_ans = generate_answer(chat_id, t["news_prompt"], lang, use_history=False, news_mode=True)
+                ans = format_news_html(raw_ans, lang)
                 save_cached_news(lang, ans)
         finally:
             stop_event.set()
         
         save_message(chat_id, "user", text) 
         save_message(chat_id, "assistant", ans)
-        send_message(chat_id, ans)
+        send_message(chat_id, ans, parse_mode="HTML")
         return "ok"
 
     # 3. Обработка обычного текстового запроса (ChatGPT)
