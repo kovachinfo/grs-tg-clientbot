@@ -4,6 +4,7 @@ import requests
 import json
 import time
 import threading
+import re
 
 from database import DatabasePool, get_db_connection
 from flask import Flask, request
@@ -47,10 +48,13 @@ TEXTS = {
         "btn_limit": "📊 Проверить лимит",
         "news_prompt": (
             "Подготовь сводку новостей (6–10 пунктов) ТОЛЬКО по миграционному праву и политике "
-            "(визы, ВНЖ/ПМЖ, гражданство, убежище, трудовая миграция, релокация). "
+            "(визы, ВНЖ/ПМЖ, гражданство, убежище, трудовая миграция, релокация), "
+            "актуальных для граждан РФ. "
             "Фокус: страны, популярные у релокантов из России, и сама Россия. "
             "Период: весь 2025 год. Используй web_search, укажи дату и источник для каждого пункта. "
             "Исключай нерелевантные новости (экономика, спорт, криминал и т.п.). "
+            "Не используй Wikipedia или другие вики-источники. "
+            "Формат ответа: простой текст без Markdown. "
             "Если в 2025 году по теме меньше 6 значимых новостей, дай меньше и укажи это."
         ),
         "contact_info": "Связаться с менеджером GRS: @globalrelocationsolutions_cz\nБоты и автоматизация: @kovachinfo",
@@ -71,10 +75,13 @@ TEXTS = {
         "btn_limit": "📊 Check Limit",
         "news_prompt": (
             "Prepare a summary (6–10 items) ONLY about migration law and policy "
-            "(visas, residence permits, citizenship, asylum, labor migration, relocation). "
+            "(visas, residence permits, citizenship, asylum, labor migration, relocation) "
+            "relevant for Russian citizens. "
             "Focus on countries popular with relocators from Russia and Russia itself. "
             "Time period: the whole of 2025. Use web_search, include date and source per item. "
             "Exclude unrelated news (economy, sports, crime, etc.). "
+            "Do not use Wikipedia or other wiki sources. "
+            "Answer in plain text, no Markdown. "
             "If fewer than 6 relevant 2025 items exist, provide fewer and state that."
         ),
         "contact_info": "Contact GRS manager: @globalrelocationsolutions_cz\nBots & automation: @kovachinfo",
@@ -162,9 +169,31 @@ def load_history(chat_id, limit=20):
         return []
 
 # ---------------------------------------------
+# Очистка простого текста (без Markdown)
+# ---------------------------------------------
+def sanitize_plain_text(text):
+    if not text:
+        return text
+
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+    text = re.sub(r"__([^_]+)__", r"\1", text)
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    text = re.sub(r"\[(.*?)\]\((.*?)\)", r"\1 — \2", text)
+    text = re.sub(r"^\s*[-*]\s+", "- ", text, flags=re.M)
+    return text.strip()
+
+def needs_news_retry(text):
+    if not text:
+        return True
+    lower = text.lower()
+    if "wikipedia.org" in lower or "wikipedia" in lower or "wiki" in lower:
+        return True
+    return False
+
+# ---------------------------------------------
 # Генерация ответа (Native Search)
 # ---------------------------------------------
-def generate_answer(chat_id, user_message, lang="ru", use_history=True):
+def generate_answer(chat_id, user_message, lang="ru", use_history=True, news_mode=False):
     history = load_history(chat_id, limit=MAX_HISTORY_MESSAGES) if use_history else []
 
     system_prompt = """Ты — миграционный консультант компании Global Relocation Solutions.
@@ -173,6 +202,8 @@ def generate_answer(chat_id, user_message, lang="ru", use_history=True):
 2. Используй ПОИСК (web_search) для актуальных данных.
 3. Язык ответа: {language}.
 """.format(language="Русский" if lang == "ru" else "English")
+    if news_mode:
+        system_prompt += "\n4. Формат ответа: простой текст без Markdown."
 
     messages = [{"role": "system", "content": system_prompt}]
     for row in history:
@@ -208,7 +239,20 @@ def generate_answer(chat_id, user_message, lang="ru", use_history=True):
             )
             return retry.choices[0].message.content.strip()
 
-        return content
+        if news_mode and needs_news_retry(content):
+            retry_rule = (
+                "5. Не используй Wikipedia/вики-источники и дай только миграционные новости."
+                if lang == "ru"
+                else "5. Do not use Wikipedia/wiki sources and only provide migration-related news."
+            )
+            messages[0]["content"] = system_prompt + "\n" + retry_rule
+            retry = client.chat.completions.create(
+                model="gpt-4o-mini-search-preview",
+                messages=messages
+            )
+            content = retry.choices[0].message.content.strip()
+
+        return sanitize_plain_text(content) if news_mode else content
 
     except Exception as e:
         err_text = str(e)
@@ -353,7 +397,7 @@ def webhook():
         try:
             # Если нажали русскую кнопку - отвечаем на русском, даже если в БД eng (опционально, но логично)
             # Но пока оставим логику по настройке в БД, чтобы не путать
-            ans = generate_answer(chat_id, t["news_prompt"], lang, use_history=False)
+            ans = generate_answer(chat_id, t["news_prompt"], lang, use_history=False, news_mode=True)
         finally:
             stop_event.set()
         
