@@ -48,14 +48,17 @@ TEXTS = {
         "btn_contact": "📝 Написать менеджеру",
         "btn_limit": "📊 Проверить лимит",
         "news_prompt": (
-            "Подготовь сводку новостей (6–10 пунктов) ТОЛЬКО по миграционному праву и политике "
-            "(визы, ВНЖ/ПМЖ, гражданство, убежище, трудовая миграция, релокация), "
-            "актуальных для граждан РФ. "
-            "Фокус: страны, популярные у релокантов из России, и сама Россия. "
-            "Период: весь 2025 год. Используй web_search, укажи дату и источник для каждого пункта. "
+            "Подготовь сводку новостей (6–10 пунктов) ТОЛЬКО по миграционному праву и политике, "
+            "актуальных для граждан РФ (релоканты: ВНЖ/ПМЖ, визы, гражданство, убежище, "
+            "трудовая/предпринимательская миграция, учеба, цифровые кочевники, репатриация). "
+            "Фокус: страны, популярные у релокантов из России, и Россия. Учитывай санкционные ограничения "
+            "и изменения правил въезда/проживания. "
+            "Период: весь 2025 год. Используй web_search. "
+            "Для каждого пункта укажи дату и источник в формате: "
+            "\"Источник: Название статьи, домен\" (без прямых ссылок). "
             "Исключай нерелевантные новости (экономика, спорт, криминал и т.п.). "
-            "Не используй Wikipedia или другие вики-источники. "
-            "Формат ответа: простой текст без Markdown. "
+            "Не используй Wikipedia или вики-источники. "
+            "Формат ответа: простой текст без Markdown; можно добавить тематические эмодзи. "
             "Если в 2025 году по теме меньше 6 значимых новостей, дай меньше и укажи это."
         ),
         "contact_info": "Связаться с менеджером GRS: @globalrelocationsolutions_cz\nБоты и автоматизация: @kovachinfo",
@@ -75,14 +78,16 @@ TEXTS = {
         "btn_contact": "📝 Contact Manager",
         "btn_limit": "📊 Check Limit",
         "news_prompt": (
-            "Prepare a summary (6–10 items) ONLY about migration law and policy "
-            "(visas, residence permits, citizenship, asylum, labor migration, relocation) "
-            "relevant for Russian citizens. "
-            "Focus on countries popular with relocators from Russia and Russia itself. "
-            "Time period: the whole of 2025. Use web_search, include date and source per item. "
+            "Prepare a summary (6–10 items) ONLY about migration law and policy relevant to Russian citizens "
+            "(visas, residence permits, citizenship, asylum, labor/business migration, study, digital nomads, "
+            "repatriation). Focus on countries popular with relocators from Russia and Russia itself; "
+            "consider sanctions and entry/residency rule changes. "
+            "Time period: the whole of 2025. Use web_search. "
+            "For each item include date and source in format: "
+            "\"Source: Article title, domain\" (no direct links). "
             "Exclude unrelated news (economy, sports, crime, etc.). "
-            "Do not use Wikipedia or other wiki sources. "
-            "Answer in plain text, no Markdown. "
+            "Do not use Wikipedia or wiki sources. "
+            "Answer in plain text, no Markdown; you may add thematic emojis. "
             "If fewer than 6 relevant 2025 items exist, provide fewer and state that."
         ),
         "contact_info": "Contact GRS manager: @globalrelocationsolutions_cz\nBots & automation: @kovachinfo",
@@ -210,6 +215,18 @@ def save_cached_news(lang, content):
     except Exception as e:
         logger.error(f"Error saving cached news: {e}")
 
+def clear_cached_news(lang=None):
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                if lang:
+                    cur.execute("DELETE FROM news_cache WHERE language_code = %s", (lang,))
+                else:
+                    cur.execute("DELETE FROM news_cache")
+                conn.commit()
+    except Exception as e:
+        logger.error(f"Error clearing cached news: {e}")
+
 # ---------------------------------------------
 # Очистка простого текста (без Markdown)
 # ---------------------------------------------
@@ -221,6 +238,7 @@ def sanitize_plain_text(text):
     text = re.sub(r"__([^_]+)__", r"\1", text)
     text = re.sub(r"`([^`]+)`", r"\1", text)
     text = re.sub(r"\[(.*?)\]\((.*?)\)", r"\1 — \2", text)
+    text = re.sub(r"https?://\S+", "", text)
     text = re.sub(r"^\s*[-*]\s+", "- ", text, flags=re.M)
     return text.strip()
 
@@ -392,6 +410,11 @@ def webhook():
     if text == "/start":
         send_message(chat_id, TEXTS[lang]["welcome"], get_lang_keyboard())
         return "ok"
+
+    if text == "/refresh_news":
+        clear_cached_news(lang)
+        send_message(chat_id, t["searching"])
+        text = t["btn_news"]
 
     # Смена языка
     if text == TEXTS["ru"]["btn_ru"] or text == "🇷🇺 Русский":
