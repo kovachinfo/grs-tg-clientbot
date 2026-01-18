@@ -62,6 +62,21 @@ def init_db():
             );
         """)
 
+        # Кэш новостей (по языку)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS news_cache (
+                id BIGSERIAL PRIMARY KEY,
+                language_code VARCHAR(10) NOT NULL,
+                content TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+        """)
+
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS news_cache_lang_created_idx
+            ON news_cache (language_code, created_at DESC);
+        """)
+
         conn.commit()
         cur.close()
         conn.close()

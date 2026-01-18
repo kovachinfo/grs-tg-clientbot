@@ -38,6 +38,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # ---------------------------------------------
 MAX_FREE_REQUESTS = 25
 MAX_HISTORY_MESSAGES = 10
+NEWS_CACHE_TTL_SEC = 24 * 60 * 60
 
 TEXTS = {
     "ru": {
@@ -167,6 +168,47 @@ def load_history(chat_id, limit=20):
     except Exception as e:
         logger.error(f"Error loading history: {e}")
         return []
+
+# ---------------------------------------------
+# Кэш новостей
+# ---------------------------------------------
+def get_cached_news(lang):
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT content, created_at
+                    FROM news_cache
+                    WHERE language_code = %s
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (lang,)
+                )
+                row = cur.fetchone()
+                if not row:
+                    return None
+                created_at = row["created_at"]
+                age_sec = (time.time() - created_at.timestamp())
+                if age_sec <= NEWS_CACHE_TTL_SEC:
+                    return row["content"]
+                return None
+    except Exception as e:
+        logger.error(f"Error getting cached news: {e}")
+        return None
+
+def save_cached_news(lang, content):
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO news_cache (language_code, content) VALUES (%s, %s)",
+                    (lang, content)
+                )
+                conn.commit()
+    except Exception as e:
+        logger.error(f"Error saving cached news: {e}")
 
 # ---------------------------------------------
 # Очистка простого текста (без Markdown)
@@ -384,7 +426,7 @@ def webhook():
         
         send_message(chat_id, t["searching"])
         increment_request_count(chat_id)
-        
+
         send_chat_action(chat_id, "typing")
         stop_event = threading.Event()
         typing_thread = threading.Thread(
@@ -395,9 +437,14 @@ def webhook():
         typing_thread.start()
 
         try:
-            # Если нажали русскую кнопку - отвечаем на русском, даже если в БД eng (опционально, но логично)
-            # Но пока оставим логику по настройке в БД, чтобы не путать
-            ans = generate_answer(chat_id, t["news_prompt"], lang, use_history=False, news_mode=True)
+            cached = get_cached_news(lang)
+            if cached:
+                ans = cached
+            else:
+                # Если нажали русскую кнопку - отвечаем на русском, даже если в БД eng (опционально, но логично)
+                # Но пока оставим логику по настройке в БД, чтобы не путать
+                ans = generate_answer(chat_id, t["news_prompt"], lang, use_history=False, news_mode=True)
+                save_cached_news(lang, ans)
         finally:
             stop_event.set()
         
