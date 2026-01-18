@@ -3,6 +3,7 @@ import logging
 import requests
 import json
 import time
+import threading
 
 from database import DatabasePool, get_db_connection
 from flask import Flask, request
@@ -44,7 +45,11 @@ TEXTS = {
         "btn_news": "📰 Актуальные новости",
         "btn_contact": "📝 Написать менеджеру",
         "btn_limit": "📊 Проверить лимит",
-        "news_prompt": "Подготовь сводку новостей (6-10 основных) в области миграционного законодательства преимущественно у стран, популярных для релокантов из России как основного направления релокации, а так же в самой России Временной период для выборки новостей - весь 2025 год.",
+        "news_prompt": (
+            "Подготовь сводку новостей (6–10 основных) в области миграционного законодательства, "
+            "преимущественно у стран, популярных для релокантов из России, а также в самой России. "
+            "Период для выборки новостей — весь 2025 год. Используй web_search и приведи источники."
+        ),
         "contact_info": "Связаться с менеджером GRS: @globalrelocationsolutions_cz\nБоты и автоматизация: @kovachinfo",
         "limit_info": "Использовано запросов: {count} из {max}.",
         "limit_reached": "🚫 Вы исчерпали лимит бесплатных запросов ({max}).\nПожалуйста, свяжитесь с менеджером для консультации: @manager_username",
@@ -61,7 +66,11 @@ TEXTS = {
         "btn_news": "📰 Latest News",
         "btn_contact": "📝 Contact Manager",
         "btn_limit": "📊 Check Limit",
-        "news_prompt": "Prepare a summary of news (6-10 main items) in the field of migration legislation, mainly in countries that are popular with relocators from Russia as the main destination for relocation, as well as in Russia itself. The time period for the news selection is the whole of 2025.",
+        "news_prompt": (
+            "Prepare a summary of news (6–10 main items) in the field of migration legislation, "
+            "mainly in countries that are popular with relocators from Russia, as well as in Russia. "
+            "The time period is the whole of 2025. Use web_search and include sources."
+        ),
         "contact_info": "Contact GRS manager: @globalrelocationsolutions_cz\nBots & automation: @kovachinfo",
         "limit_info": "Requests used: {count} of {max}.",
         "limit_reached": "🚫 You have reached the free request limit ({max}).\nPlease contact the manager: @manager_username",
@@ -171,7 +180,29 @@ def generate_answer(chat_id, user_message, lang="ru", use_history=True):
             model="gpt-4o-mini-search-preview",
             messages=messages
         )
-        return response.choices[0].message.content.strip()
+        content = response.choices[0].message.content.strip()
+        content_l = content.lower()
+
+        if (
+            "нет доступа" in content_l
+            or "no access" in content_l
+            or "don't have access" in content_l
+            or "do not have access" in content_l
+        ):
+            retry_rule = (
+                "4. Обязательно используй web_search и не сообщай об ограничениях доступа."
+                if lang == "ru"
+                else "4. You must use web_search and do not mention access limitations."
+            )
+            retry_prompt = system_prompt + "\n" + retry_rule
+            messages[0]["content"] = retry_prompt
+            retry = client.chat.completions.create(
+                model="gpt-4o-mini-search-preview",
+                messages=messages
+            )
+            return retry.choices[0].message.content.strip()
+
+        return content
 
     except Exception as e:
         err_text = str(e)
@@ -203,6 +234,21 @@ def send_message(chat_id, text, keyboard=None):
             logger.error("Send Error: %s %s", resp.status_code, resp.text)
     except Exception as e:
         logger.error(f"Send Error: {e}")
+
+def send_chat_action(chat_id, action="typing"):
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendChatAction"
+        payload = {"chat_id": chat_id, "action": action}
+        resp = requests.post(url, json=payload)
+        if not resp.ok:
+            logger.error("Chat Action Error: %s %s", resp.status_code, resp.text)
+    except Exception as e:
+        logger.error(f"Chat Action Error: {e}")
+
+def run_typing(chat_id, stop_event, interval_sec=4):
+    while not stop_event.is_set():
+        send_chat_action(chat_id, "typing")
+        stop_event.wait(interval_sec)
 
 def get_main_keyboard(lang):
     t = TEXTS[lang]
@@ -289,9 +335,20 @@ def webhook():
         send_message(chat_id, t["searching"])
         increment_request_count(chat_id)
         
-        # Если нажали русскую кнопку - отвечаем на русском, даже если в БД eng (опционально, но логично)
-        # Но пока оставим логику по настройке в БД, чтобы не путать
-        ans = generate_answer(chat_id, t["news_prompt"], lang, use_history=False)
+        stop_event = threading.Event()
+        typing_thread = threading.Thread(
+            target=run_typing,
+            args=(chat_id, stop_event),
+            daemon=True
+        )
+        typing_thread.start()
+
+        try:
+            # Если нажали русскую кнопку - отвечаем на русском, даже если в БД eng (опционально, но логично)
+            # Но пока оставим логику по настройке в БД, чтобы не путать
+            ans = generate_answer(chat_id, t["news_prompt"], lang, use_history=False)
+        finally:
+            stop_event.set()
         
         save_message(chat_id, "user", text) 
         save_message(chat_id, "assistant", ans)
