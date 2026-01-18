@@ -46,9 +46,12 @@ TEXTS = {
         "btn_contact": "📝 Написать менеджеру",
         "btn_limit": "📊 Проверить лимит",
         "news_prompt": (
-            "Подготовь сводку новостей (6–10 основных) в области миграционного законодательства, "
-            "преимущественно у стран, популярных для релокантов из России, а также в самой России. "
-            "Период для выборки новостей — весь 2025 год. Используй web_search и приведи источники."
+            "Подготовь сводку новостей (6–10 пунктов) ТОЛЬКО по миграционному праву и политике "
+            "(визы, ВНЖ/ПМЖ, гражданство, убежище, трудовая миграция, релокация). "
+            "Фокус: страны, популярные у релокантов из России, и сама Россия. "
+            "Период: весь 2025 год. Используй web_search, укажи дату и источник для каждого пункта. "
+            "Исключай нерелевантные новости (экономика, спорт, криминал и т.п.). "
+            "Если в 2025 году по теме меньше 6 значимых новостей, дай меньше и укажи это."
         ),
         "contact_info": "Связаться с менеджером GRS: @globalrelocationsolutions_cz\nБоты и автоматизация: @kovachinfo",
         "limit_info": "Использовано запросов: {count} из {max}.",
@@ -67,9 +70,12 @@ TEXTS = {
         "btn_contact": "📝 Contact Manager",
         "btn_limit": "📊 Check Limit",
         "news_prompt": (
-            "Prepare a summary of news (6–10 main items) in the field of migration legislation, "
-            "mainly in countries that are popular with relocators from Russia, as well as in Russia. "
-            "The time period is the whole of 2025. Use web_search and include sources."
+            "Prepare a summary (6–10 items) ONLY about migration law and policy "
+            "(visas, residence permits, citizenship, asylum, labor migration, relocation). "
+            "Focus on countries popular with relocators from Russia and Russia itself. "
+            "Time period: the whole of 2025. Use web_search, include date and source per item. "
+            "Exclude unrelated news (economy, sports, crime, etc.). "
+            "If fewer than 6 relevant 2025 items exist, provide fewer and state that."
         ),
         "contact_info": "Contact GRS manager: @globalrelocationsolutions_cz\nBots & automation: @kovachinfo",
         "limit_info": "Requests used: {count} of {max}.",
@@ -245,7 +251,7 @@ def send_chat_action(chat_id, action="typing"):
     except Exception as e:
         logger.error(f"Chat Action Error: {e}")
 
-def run_typing(chat_id, stop_event, interval_sec=4):
+def run_typing(chat_id, stop_event, interval_sec=2):
     while not stop_event.is_set():
         send_chat_action(chat_id, "typing")
         stop_event.wait(interval_sec)
@@ -335,6 +341,7 @@ def webhook():
         send_message(chat_id, t["searching"])
         increment_request_count(chat_id)
         
+        send_chat_action(chat_id, "typing")
         stop_event = threading.Event()
         typing_thread = threading.Thread(
             target=run_typing,
