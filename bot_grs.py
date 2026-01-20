@@ -30,8 +30,6 @@ app = Flask(__name__)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
-OPENAI_PROMPT_ID = os.getenv("OPENAI_PROMPT_ID", "pmpt_696d0d3de06481978c45ffeb3e8e02cf0bb66848bed5b2a9")
-OPENAI_PROMPT_VERSION = os.getenv("OPENAI_PROMPT_VERSION", "2")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -312,7 +310,35 @@ def format_news_html(text, lang):
 def generate_answer(chat_id, user_message, lang="ru", use_history=True, news_mode=False):
     history = load_history(chat_id, limit=MAX_HISTORY_MESSAGES) if use_history else []
 
-    messages = []
+    system_prompt = """Ты — AI-консультант по вопросам миграционного права и ВНЖ/ПМЖ в странах ЕС.
+
+Твоя задача — предоставлять актуальную, проверяемую информацию,
+учитывая, что миграционное законодательство часто меняется.
+
+Обязательные правила:
+- Никогда не гарантируй получение ВНЖ или гражданства.
+- Всегда указывай, что финальное решение принимает государственный орган.
+- Если информация может быть устаревшей — прямо укажи это.
+- При недостатке данных задавай уточняющие вопросы.
+- Не предлагай выполнить какие-то действия, ты - информационная служба.
+- Не делай преамбул и пост-скриптумов, переходи сразу к сути
+
+Стиль:
+- профессиональный
+- нейтральный
+- без эмоциональных оценок
+- без давления
+
+Коммерческая часть:
+- Ты можешь ненавязчиво упоминать, что существуют профессиональные услуги сопровождения,
+  ТОЛЬКО если это логично вытекает из запроса пользователя.
+- Никогда не начинай ответ с рекламы.
+- Основной фокус — полезная информация для пользователя.
+"""
+    if news_mode:
+        system_prompt += "\nФормат ответа: простой текст без Markdown."
+
+    messages = [{"role": "system", "content": system_prompt}]
     for row in history:
         messages.append({"role": row["role"], "content": row["content"]})
     messages.append({"role": "user", "content": user_message})
@@ -320,15 +346,11 @@ def generate_answer(chat_id, user_message, lang="ru", use_history=True, news_mod
     # В preview-моделях поиск работает нативно (implicit), без явного указания tools
     # Model: gpt-4o-mini-search-preview
     try:
-        response = client.responses.create(
-            prompt={
-                "id": OPENAI_PROMPT_ID,
-                "version": OPENAI_PROMPT_VERSION
-            },
-            input=messages,
-            max_output_tokens=2048
+        response = client.chat.completions.create(
+            model="gpt-4o-mini-search-preview",
+            messages=messages
         )
-        content = (response.output_text or "").strip()
+        content = response.choices[0].message.content.strip()
         content_l = content.lower()
 
         if (
@@ -343,15 +365,11 @@ def generate_answer(chat_id, user_message, lang="ru", use_history=True, news_mod
                 else "Please use web_search and do not mention access limitations."
             )
             retry_messages = messages + [{"role": "user", "content": retry_rule}]
-            retry = client.responses.create(
-                prompt={
-                    "id": OPENAI_PROMPT_ID,
-                    "version": OPENAI_PROMPT_VERSION
-                },
-                input=retry_messages,
-                max_output_tokens=2048
+            retry = client.chat.completions.create(
+                model="gpt-4o-mini-search-preview",
+                messages=retry_messages
             )
-            return (retry.output_text or "").strip()
+            return retry.choices[0].message.content.strip()
 
         if news_mode and needs_news_retry(content):
             retry_rule = (
@@ -360,15 +378,11 @@ def generate_answer(chat_id, user_message, lang="ru", use_history=True, news_mod
                 else "Do not use Wikipedia/wiki sources and only provide news for Russian relocators."
             )
             retry_messages = messages + [{"role": "user", "content": retry_rule}]
-            retry = client.responses.create(
-                prompt={
-                    "id": OPENAI_PROMPT_ID,
-                    "version": OPENAI_PROMPT_VERSION
-                },
-                input=retry_messages,
-                max_output_tokens=2048
+            retry = client.chat.completions.create(
+                model="gpt-4o-mini-search-preview",
+                messages=retry_messages
             )
-            content = (retry.output_text or "").strip()
+            content = retry.choices[0].message.content.strip()
 
         return sanitize_plain_text(content) if news_mode else content
 
@@ -378,11 +392,8 @@ def generate_answer(chat_id, user_message, lang="ru", use_history=True, news_mod
 
         # Попытка fallback без поиска, если превысили лимиты
         try:
-            fb = client.responses.create(
-                input=messages,
-                max_output_tokens=1024
-            )
-            return (fb.output_text or "").strip()
+            fb = client.chat.completions.create(model="gpt-4o-mini", messages=messages)
+            return fb.choices[0].message.content.strip()
         except Exception as fb_err:
             logger.error(f"Fallback error: {fb_err}")
             if "rate_limit" in err_text or "token" in err_text.lower():
