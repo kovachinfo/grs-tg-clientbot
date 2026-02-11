@@ -1,2 +1,3 @@
 __pycache__/
 .env
+docs/n8n_workflow.json
