@@ -1,8 +1,9 @@
-import psycopg2
 import os
-from psycopg2.extras import RealDictCursor
 import logging
+
+import psycopg2
 from dotenv import load_dotenv
+from psycopg2.extras import RealDictCursor
 
 load_dotenv()
 
@@ -11,23 +12,8 @@ logger = logging.getLogger("grs-init")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Manual fallback for .env if load_dotenv failed
-if not DATABASE_URL and os.path.exists(".env"):
-    print("Trying manual .env parse...")
-    with open(".env", "r") as f:
-        for line in f:
-            if line.startswith("DATABASE_URL="):
-                DATABASE_URL = line.strip().split("=", 1)[1]
-                print(f"Manually loaded DATABASE_URL: {DATABASE_URL[:10]}...")
-                break
-
-print(f"CWD: {os.getcwd()}")
-print(f"DATABASE_URL: {DATABASE_URL}")
-
 def init_db():
     if not DATABASE_URL:
-        # Попытка жесткого чтения для отладки (не рекомендуется в проде, но здесь нужно починить)
-        print("Files in dir:", os.listdir())
         raise RuntimeError("❌ DATABASE_URL не задан")
 
     try:

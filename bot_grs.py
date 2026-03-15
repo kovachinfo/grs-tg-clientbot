@@ -1,15 +1,15 @@
 import os
 import logging
 import requests
-import json
 import time
 import threading
 import re
 
-from database import DatabasePool, get_db_connection
+from dotenv import load_dotenv
 from flask import Flask, request
 from openai import OpenAI
-from dotenv import load_dotenv
+
+from database import DatabasePool, get_db_connection
 
 load_dotenv()
 
@@ -28,8 +28,9 @@ app = Flask(__name__)
 # Ключи и токены
 # ---------------------------------------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-DATABASE_URL = os.getenv("DATABASE_URL")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -39,6 +40,8 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 MAX_FREE_REQUESTS = 25
 MAX_HISTORY_MESSAGES = 10
 NEWS_CACHE_TTL_SEC = 24 * 60 * 60
+TELEGRAM_MAX_MESSAGE_LEN = 4096
+REQUEST_TIMEOUT_SEC = 15
 
 TEXTS = {
     "ru": {
@@ -288,7 +291,7 @@ def format_news_html(text, lang):
     items = []
     current = []
     for ln in lines:
-        if re.match(r"^\\d+[\\).]\\s+", ln):
+        if re.match(r"^\d+[\).]\s+", ln):
             if current:
                 items.append(" ".join(current))
                 current = []
@@ -304,8 +307,49 @@ def format_news_html(text, lang):
     body = "\n".join(formatted) if formatted else escape_html(text)
     return f"{header}\n\n{body}".strip()
 
+
+def split_message_chunks(text, limit=TELEGRAM_MAX_MESSAGE_LEN):
+    if not text:
+        return [""]
+
+    if len(text) <= limit:
+        return [text]
+
+    chunks = []
+    current = []
+    current_len = 0
+
+    for line in text.splitlines(keepends=True):
+        line_len = len(line)
+        if line_len > limit:
+            if current:
+                chunks.append("".join(current).rstrip())
+                current = []
+                current_len = 0
+
+            start = 0
+            while start < line_len:
+                end = min(start + limit, line_len)
+                chunks.append(line[start:end].rstrip())
+                start = end
+            continue
+
+        if current_len + line_len > limit:
+            chunks.append("".join(current).rstrip())
+            current = [line]
+            current_len = line_len
+            continue
+
+        current.append(line)
+        current_len += line_len
+
+    if current:
+        chunks.append("".join(current).rstrip())
+
+    return chunks
+
 # ---------------------------------------------
-# Генерация ответа (Native Search)
+# Генерация ответа (Responses API + web_search)
 # ---------------------------------------------
 def generate_answer(chat_id, user_message, lang="ru", use_history=True, news_mode=False):
     history = load_history(chat_id, limit=MAX_HISTORY_MESSAGES) if use_history else []
@@ -343,14 +387,13 @@ def generate_answer(chat_id, user_message, lang="ru", use_history=True, news_mod
         messages.append({"role": row["role"], "content": row["content"]})
     messages.append({"role": "user", "content": user_message})
 
-    # В preview-моделях поиск работает нативно (implicit), без явного указания tools
-    # Model: gpt-4o-mini-search-preview
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini-search-preview",
-            messages=messages
+        response = client.responses.create(
+            model=OPENAI_MODEL,
+            input=messages,
+            tools=[{"type": "web_search", "search_context_size": "medium"}]
         )
-        content = response.choices[0].message.content.strip()
+        content = (response.output_text or "").strip()
         content_l = content.lower()
 
         if (
@@ -365,11 +408,12 @@ def generate_answer(chat_id, user_message, lang="ru", use_history=True, news_mod
                 else "Please use web_search and do not mention access limitations."
             )
             retry_messages = messages + [{"role": "user", "content": retry_rule}]
-            retry = client.chat.completions.create(
-                model="gpt-4o-mini-search-preview",
-                messages=retry_messages
+            retry = client.responses.create(
+                model=OPENAI_MODEL,
+                input=retry_messages,
+                tools=[{"type": "web_search", "search_context_size": "medium"}]
             )
-            return retry.choices[0].message.content.strip()
+            return (retry.output_text or "").strip()
 
         if news_mode and needs_news_retry(content):
             retry_rule = (
@@ -378,22 +422,23 @@ def generate_answer(chat_id, user_message, lang="ru", use_history=True, news_mod
                 else "Do not use Wikipedia/wiki sources and only provide news for Russian relocators."
             )
             retry_messages = messages + [{"role": "user", "content": retry_rule}]
-            retry = client.chat.completions.create(
-                model="gpt-4o-mini-search-preview",
-                messages=retry_messages
+            retry = client.responses.create(
+                model=OPENAI_MODEL,
+                input=retry_messages,
+                tools=[{"type": "web_search", "search_context_size": "medium"}]
             )
-            content = retry.choices[0].message.content.strip()
+            content = (retry.output_text or "").strip()
 
         return sanitize_plain_text(content) if news_mode else content
 
     except Exception as e:
         err_text = str(e)
-        logger.error(f"Error OpenAI (Search Preview): {err_text}")
+        logger.error(f"Error OpenAI (Responses API): {err_text}")
 
-        # Попытка fallback без поиска, если превысили лимиты
         try:
-            fb = client.chat.completions.create(model="gpt-4o-mini", messages=messages)
-            return fb.choices[0].message.content.strip()
+            fb = client.responses.create(model=OPENAI_MODEL, input=messages)
+            fb_text = (fb.output_text or "").strip()
+            return sanitize_plain_text(fb_text) if news_mode else fb_text
         except Exception as fb_err:
             logger.error(f"Fallback error: {fb_err}")
             if "rate_limit" in err_text or "token" in err_text.lower():
@@ -406,16 +451,20 @@ def generate_answer(chat_id, user_message, lang="ru", use_history=True, news_mod
 def send_message(chat_id, text, keyboard=None, parse_mode=None):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        payload = {"chat_id": chat_id, "text": text}
+        chunks = split_message_chunks(text)
 
-        if keyboard:
-            payload["reply_markup"] = json.dumps(keyboard)
-        if parse_mode:
-            payload["parse_mode"] = parse_mode
+        for index, chunk in enumerate(chunks):
+            payload = {"chat_id": chat_id, "text": chunk}
 
-        resp = requests.post(url, json=payload)
-        if not resp.ok:
-            logger.error("Send Error: %s %s", resp.status_code, resp.text)
+            if keyboard and index == 0:
+                payload["reply_markup"] = keyboard
+            if parse_mode:
+                payload["parse_mode"] = parse_mode
+
+            resp = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT_SEC)
+            if not resp.ok:
+                logger.error("Send Error: %s %s", resp.status_code, resp.text)
+                break
     except Exception as e:
         logger.error(f"Send Error: {e}")
 
@@ -423,7 +472,7 @@ def send_chat_action(chat_id, action="typing"):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendChatAction"
         payload = {"chat_id": chat_id, "action": action}
-        resp = requests.post(url, json=payload)
+        resp = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT_SEC)
         if not resp.ok:
             logger.error("Chat Action Error: %s %s", resp.status_code, resp.text)
     except Exception as e:
@@ -458,7 +507,13 @@ def get_lang_keyboard():
 # ---------------------------------------------
 @app.route(f"/webhook/{TELEGRAM_TOKEN}", methods=["POST"])
 def webhook():
-    data = request.get_json()
+    if TELEGRAM_WEBHOOK_SECRET:
+        secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+        if secret != TELEGRAM_WEBHOOK_SECRET:
+            logger.warning("Webhook rejected due to invalid secret token.")
+            return "forbidden", 403
+
+    data = request.get_json(silent=True)
     if not data or "message" not in data:
         return "ok"
 

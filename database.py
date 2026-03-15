@@ -1,13 +1,21 @@
-import psycopg2
-from psycopg2 import pool
-from psycopg2.extras import RealDictCursor
-import os
 import logging
+import os
 from contextlib import contextmanager
+
+import psycopg2
+from dotenv import load_dotenv
+from psycopg2.extras import RealDictCursor
 
 logger = logging.getLogger("grs-db")
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+load_dotenv()
+
+
+def get_database_url():
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        raise RuntimeError("DATABASE_URL is not set")
+    return database_url
 
 class DatabasePool:
     _pool = None
@@ -16,9 +24,9 @@ class DatabasePool:
     def initialize(cls):
         if cls._pool is None:
             try:
-                cls._pool = psycopg2.pool.SimpleConnectionPool(
+                cls._pool = psycopg2.pool.ThreadedConnectionPool(
                     1, 20,
-                    dsn=DATABASE_URL,
+                    dsn=get_database_url(),
                     cursor_factory=RealDictCursor
                 )
                 logger.info("Database connection pool initialized.")
@@ -31,10 +39,13 @@ class DatabasePool:
     def get_connection(cls):
         if cls._pool is None:
             cls.initialize()
-        
+
         conn = cls._pool.getconn()
         try:
             yield conn
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             cls._pool.putconn(conn)
 

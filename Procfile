@@ -1,2 +1,1 @@
-web: gunicorn bot_grs:app
-worker: rq worker answers
+web: gunicorn --bind 0.0.0.0:$PORT bot_grs:app
