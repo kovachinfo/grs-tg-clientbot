@@ -5,6 +5,7 @@ import time
 import threading
 import re
 from datetime import datetime, timedelta, timezone
+from importlib.metadata import PackageNotFoundError, version
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
@@ -211,6 +212,23 @@ GLOBAL_NEWS_NEGATIVE_KEYWORDS = [
 ]
 
 
+def get_package_version(name):
+    try:
+        return version(name)
+    except PackageNotFoundError:
+        return "unknown"
+
+
+print(
+    "Startup config "
+    f"openai_sdk={get_package_version('openai')} "
+    f"openai_model={OPENAI_MODEL} "
+    f"openai_news_model={OPENAI_NEWS_MODEL or '<empty>'} "
+    f"news_lookback_days={NEWS_LOOKBACK_DAYS}",
+    flush=True,
+)
+
+
 TEXTS = {
     "ru": {
         "welcome": "Добро пожаловать в GRS Bot! 🌍\nПожалуйста, выберите язык:",
@@ -320,7 +338,7 @@ def get_allowed_news_domains():
     return unique
 
 
-def build_source_profile_prompt(lang):
+def build_source_profile_prompt(lang, compact=False):
     profiles = get_news_source_profiles()
     lines = []
 
@@ -329,6 +347,17 @@ def build_source_profile_prompt(lang):
         section_hint = ", ".join(profile.get("section_hints", [])) or "-"
         positive_keywords = ", ".join(profile.get("positive_keywords", [])[:8]) or "-"
         negative_keywords = ", ".join(profile.get("negative_keywords", [])[:6]) or "-"
+
+        if compact:
+            if lang == "ru":
+                lines.append(
+                    f"- {profile['label']} ({profile['domain']}): path {path_hint}; разделы {section_hint}."
+                )
+            else:
+                lines.append(
+                    f"- {profile['label']} ({profile['domain']}): path {path_hint}; sections {section_hint}."
+                )
+            continue
 
         if lang == "ru":
             rule_parts = [
@@ -360,11 +389,11 @@ def build_source_profile_prompt(lang):
     return "\n".join(lines)
 
 
-def build_news_prompt(lang):
+def build_news_prompt(lang, compact=False):
     today = datetime.now(timezone.utc).date()
     start_date = today - timedelta(days=NEWS_LOOKBACK_DAYS)
     allowed_domains = get_allowed_news_domains()
-    source_profiles = build_source_profile_prompt(lang)
+    source_profiles = build_source_profile_prompt(lang, compact=compact)
     positive_keywords = ", ".join(GLOBAL_NEWS_POSITIVE_KEYWORDS)
     negative_keywords = ", ".join(GLOBAL_NEWS_NEGATIVE_KEYWORDS)
 
@@ -392,8 +421,12 @@ def build_news_prompt(lang):
             f"Общие негативные ключевые слова: {negative_keywords}. "
             "Статические гайды, SEO-обзоры, маркетинговые статьи, рейтинги и evergreen-материалы не включай, "
             "если в них нет конкретного свежего изменения закона, процедуры или официального режима. "
-            "Профили источников и допустимые разделы:\n"
-            f"{source_profiles}\n"
+            + (
+                "Короткий список допустимых источников и разделов:\n"
+                if compact else
+                "Профили источников и допустимые разделы:\n"
+            )
+            + f"{source_profiles}\n"
             "Для каждого пункта укажи: дату, страну, краткое объяснение, почему это важно релокантам из РФ, "
             "и источник в формате: Источник: Название статьи, домен. "
             "Формат ответа: простой текст без Markdown, нумерованный список вида "
@@ -425,8 +458,12 @@ def build_news_prompt(lang):
         f"Global negative keywords: {negative_keywords}. "
         "Exclude evergreen guides, SEO explainers, service-marketing pages, rankings, and static overviews unless "
         "they clearly describe a fresh law, policy, or procedure change in the target date range. "
-        "Source profiles and allowed sections:\n"
-        f"{source_profiles}\n"
+        + (
+            "Compact source list and allowed sections:\n"
+            if compact else
+            "Source profiles and allowed sections:\n"
+        )
+        + f"{source_profiles}\n"
         "For each item provide the date, country, a short explanation of why it matters to Russian relocators, "
         "and a source in the format: Source: Article title, domain. "
         "Answer in plain text without Markdown as a numbered list like "
@@ -589,9 +626,9 @@ def is_service_message(text, lang):
     return text in {TEXTS[lang]["error"], TEXTS[lang]["rate_limited"]}
 
 
-def build_web_search_tool(news_mode=False):
+def build_web_search_tool(news_mode=False, include_filters=True):
     tool = {"type": "web_search", "search_context_size": "medium"}
-    if news_mode:
+    if news_mode and include_filters:
         allowed_domains = get_allowed_news_domains()
         if allowed_domains:
             tool["filters"] = {"allowed_domains": allowed_domains}
@@ -609,41 +646,48 @@ def get_response_models(news_mode=False):
     return candidates
 
 
+def get_tool_variants(news_mode=False):
+    if not news_mode:
+        return [("default", build_web_search_tool(news_mode=False))]
+
+    return [
+        ("filtered", build_web_search_tool(news_mode=True, include_filters=True)),
+        ("unfiltered", build_web_search_tool(news_mode=True, include_filters=False)),
+    ]
+
+
 def create_response(messages, lang="ru", news_mode=False):
     last_error = None
-    web_search_tool = build_web_search_tool(news_mode=news_mode)
-    allowed_domains = (
-        web_search_tool.get("filters", {}).get("allowed_domains", [])
-        if news_mode else
-        []
-    )
 
-    for model in get_response_models(news_mode=news_mode):
-        try:
-            request_payload = {
-                "model": model,
-                "input": messages,
-                "tools": [web_search_tool]
-            }
-            logger.info(
-                "OpenAI request start model=%s news_mode=%s messages=%s domains=%s last_user_chars=%s",
-                model,
-                news_mode,
-                len(messages),
-                len(allowed_domains),
-                len(str(messages[-1].get("content", ""))) if messages else 0,
-            )
-            response = client.responses.create(**request_payload)
-            return response, model
-        except Exception as exc:
-            last_error = exc
-            logger.exception(
-                "OpenAI request failed for model=%s news_mode=%s exc_type=%s domains=%s",
-                model,
-                news_mode,
-                exc.__class__.__name__,
-                len(allowed_domains),
-            )
+    for variant_name, web_search_tool in get_tool_variants(news_mode=news_mode):
+        allowed_domains = web_search_tool.get("filters", {}).get("allowed_domains", [])
+
+        for model in get_response_models(news_mode=news_mode):
+            try:
+                request_payload = {
+                    "model": model,
+                    "input": messages,
+                    "tools": [web_search_tool]
+                }
+                msg = (
+                    "OpenAI request start "
+                    f"model={model} news_mode={news_mode} variant={variant_name} "
+                    f"messages={len(messages)} domains={len(allowed_domains)} "
+                    f"last_user_chars={len(str(messages[-1].get('content', ''))) if messages else 0}"
+                )
+                logger.info(msg)
+                print(msg, flush=True)
+                response = client.responses.create(**request_payload)
+                return response, model
+            except Exception as exc:
+                last_error = exc
+                err_msg = (
+                    "OpenAI request failed "
+                    f"model={model} news_mode={news_mode} variant={variant_name} "
+                    f"exc_type={exc.__class__.__name__} domains={len(allowed_domains)} err={exc}"
+                )
+                logger.exception(err_msg)
+                print(err_msg, flush=True)
 
     raise last_error
 
@@ -774,15 +818,14 @@ def generate_answer(chat_id, user_message, lang="ru", use_history=True, news_mod
     for row in history:
         messages.append({"role": row["role"], "content": row["content"]})
     messages.append({"role": "user", "content": user_message})
-    logger.info(
-        "Generate answer chat_id=%s lang=%s news_mode=%s use_history=%s history_messages=%s prompt_chars=%s",
-        chat_id,
-        lang,
-        news_mode,
-        use_history,
-        len(history),
-        len(user_message or ""),
+    gen_msg = (
+        "Generate answer "
+        f"chat_id={chat_id} lang={lang} news_mode={news_mode} "
+        f"use_history={use_history} history_messages={len(history)} "
+        f"prompt_chars={len(user_message or '')}"
     )
+    logger.info(gen_msg)
+    print(gen_msg, flush=True)
 
     try:
         response, model_used = create_response(messages, lang=lang, news_mode=news_mode)
@@ -822,6 +865,7 @@ def generate_answer(chat_id, user_message, lang="ru", use_history=True, news_mod
     except Exception as e:
         err_text = str(e)
         logger.exception("Error OpenAI (Responses API): %s", err_text)
+        print(f"Error OpenAI (Responses API): {err_text}", flush=True)
 
         try:
             fb = client.responses.create(model=OPENAI_MODEL, input=messages)
@@ -829,6 +873,7 @@ def generate_answer(chat_id, user_message, lang="ru", use_history=True, news_mod
             return sanitize_plain_text(fb_text) if news_mode else fb_text
         except Exception as fb_err:
             logger.exception("Fallback error: %s", fb_err)
+            print(f"Fallback error: {fb_err}", flush=True)
             if "rate_limit" in err_text or "token" in err_text.lower():
                 return TEXTS[lang]["rate_limited"]
             return TEXTS[lang]["error"]
@@ -988,6 +1033,20 @@ def webhook():
                     use_history=False,
                     news_mode=True
                 )
+                if is_service_message(raw_ans, lang):
+                    compact_prompt = build_news_prompt(lang, compact=True)
+                    print(
+                        "News retry with compact prompt "
+                        f"chat_id={chat_id} lang={lang} prompt_chars={len(compact_prompt)}",
+                        flush=True,
+                    )
+                    raw_ans = generate_answer(
+                        chat_id,
+                        compact_prompt,
+                        lang,
+                        use_history=False,
+                        news_mode=True
+                    )
                 if is_service_message(raw_ans, lang):
                     ans = raw_ans
                 else:
