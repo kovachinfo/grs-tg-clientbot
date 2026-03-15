@@ -612,6 +612,11 @@ def get_response_models(news_mode=False):
 def create_response(messages, lang="ru", news_mode=False):
     last_error = None
     web_search_tool = build_web_search_tool(news_mode=news_mode)
+    allowed_domains = (
+        web_search_tool.get("filters", {}).get("allowed_domains", [])
+        if news_mode else
+        []
+    )
 
     for model in get_response_models(news_mode=news_mode):
         try:
@@ -620,15 +625,24 @@ def create_response(messages, lang="ru", news_mode=False):
                 "input": messages,
                 "tools": [web_search_tool]
             }
+            logger.info(
+                "OpenAI request start model=%s news_mode=%s messages=%s domains=%s last_user_chars=%s",
+                model,
+                news_mode,
+                len(messages),
+                len(allowed_domains),
+                len(str(messages[-1].get("content", ""))) if messages else 0,
+            )
             response = client.responses.create(**request_payload)
             return response, model
         except Exception as exc:
             last_error = exc
-            logger.error(
-                "OpenAI request failed for model=%s news_mode=%s: %s",
+            logger.exception(
+                "OpenAI request failed for model=%s news_mode=%s exc_type=%s domains=%s",
                 model,
                 news_mode,
-                exc
+                exc.__class__.__name__,
+                len(allowed_domains),
             )
 
     raise last_error
@@ -760,6 +774,15 @@ def generate_answer(chat_id, user_message, lang="ru", use_history=True, news_mod
     for row in history:
         messages.append({"role": row["role"], "content": row["content"]})
     messages.append({"role": "user", "content": user_message})
+    logger.info(
+        "Generate answer chat_id=%s lang=%s news_mode=%s use_history=%s history_messages=%s prompt_chars=%s",
+        chat_id,
+        lang,
+        news_mode,
+        use_history,
+        len(history),
+        len(user_message or ""),
+    )
 
     try:
         response, model_used = create_response(messages, lang=lang, news_mode=news_mode)
@@ -798,14 +821,14 @@ def generate_answer(chat_id, user_message, lang="ru", use_history=True, news_mod
 
     except Exception as e:
         err_text = str(e)
-        logger.error(f"Error OpenAI (Responses API): {err_text}")
+        logger.exception("Error OpenAI (Responses API): %s", err_text)
 
         try:
             fb = client.responses.create(model=OPENAI_MODEL, input=messages)
             fb_text = (fb.output_text or "").strip()
             return sanitize_plain_text(fb_text) if news_mode else fb_text
         except Exception as fb_err:
-            logger.error(f"Fallback error: {fb_err}")
+            logger.exception("Fallback error: %s", fb_err)
             if "rate_limit" in err_text or "token" in err_text.lower():
                 return TEXTS[lang]["rate_limited"]
             return TEXTS[lang]["error"]
