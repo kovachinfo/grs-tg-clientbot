@@ -5,6 +5,7 @@ from contextlib import contextmanager
 import psycopg2
 from dotenv import load_dotenv
 from psycopg2.extras import RealDictCursor
+from psycopg2.pool import ThreadedConnectionPool
 
 logger = logging.getLogger("grs-db")
 
@@ -24,7 +25,7 @@ class DatabasePool:
     def initialize(cls):
         if cls._pool is None:
             try:
-                cls._pool = psycopg2.pool.ThreadedConnectionPool(
+                cls._pool = ThreadedConnectionPool(
                     1, 20,
                     dsn=get_database_url(),
                     cursor_factory=RealDictCursor
