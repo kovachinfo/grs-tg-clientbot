@@ -55,6 +55,7 @@ NEWS_CACHE_TTL_SEC = 24 * 60 * 60
 TELEGRAM_MAX_MESSAGE_LEN = 4096
 REQUEST_TIMEOUT_SEC = 15
 PROCESSED_UPDATE_TTL_SEC = 10 * 60
+TARGET_NEWS_ITEMS = 10
 
 processed_updates = {}
 processed_updates_lock = threading.Lock()
@@ -445,91 +446,60 @@ def build_news_prompt(lang, compact=False):
     start_date = today - timedelta(days=NEWS_LOOKBACK_DAYS)
     allowed_domains = get_allowed_news_domains()
     source_profiles = build_source_profile_prompt(lang, compact=True)
-    positive_keywords = ", ".join(GLOBAL_NEWS_POSITIVE_KEYWORDS)
-    negative_keywords = ", ".join(GLOBAL_NEWS_NEGATIVE_KEYWORDS)
 
     if lang == "ru":
         domain_rule = (
-            "Используй эти домены как основной пул источников: "
-            f"{', '.join(allowed_domains)}. Старайся брать новости минимум с 3 разных доменов, "
-            "если по теме есть достаточно материалов. Не давай больше 2 пунктов с одного домена, "
-            "если можно собрать более разнообразную выборку. Если релевантных материалов мало, "
-            "прямо напиши, что выборка ограничена указанными источниками."
+            "Работай только по этому пулу доменов: "
+            f"{', '.join(allowed_domains)}. Сначала попробуй собрать подборку с разных сайтов и разных стран."
             if allowed_domains else
-            "Используй несколько независимых новостных или официальных источников, а не один сайт."
+            "Используй несколько независимых источников, а не один сайт."
         )
         return (
-            "Подготовь сводку из 8-10 пунктов только по миграционному праву, миграционной политике и "
-            "процедурам легализации, которые важны для релокантов из России. "
+            f"Подготовь сводку из {TARGET_NEWS_ITEMS} новостей для релокантов из России. "
             f"Период публикации: с {start_date.isoformat()} по {today.isoformat()}. "
-            "Включай только новости об изменениях виз, ВНЖ/ПМЖ, гражданства, убежища, трудовой или "
-            "предпринимательской миграции, учебы, digital nomad программ, воссоединения семьи, "
-            "репатриации, консульских и санкционных ограничений, если они влияют на выезд, въезд, "
-            "легализацию или проживание граждан РФ за рубежом. "
-            "Исключай криминал, происшествия, экономику, спорт, вакансии, общую внутреннюю политику без "
-            "миграционного эффекта, а также новости, не связанные с релокантами из РФ. "
+            "Темы: визы, ВНЖ/ПМЖ, гражданство, правила въезда, трудовая и учебная миграция, digital nomad, "
+            "воссоединение семьи, легализация, консульские ограничения. "
+            "Приоритет: страны за пределами РФ. Новости из России включай только если они прямо влияют на тех, "
+            "кто уже живет за рубежом или собирается переезжать. "
             f"{domain_rule} "
-            "Сначала отфильтруй кандидатов по источнику, URL/path, рубрике и ключевым словам. "
-            f"Общие позитивные ключевые слова: {positive_keywords}. "
-            f"Общие негативные ключевые слова: {negative_keywords}. "
-            "Статические гайды, SEO-обзоры, маркетинговые статьи, рейтинги и evergreen-материалы не включай, "
-            "если в них нет конкретного свежего изменения закона, процедуры или официального режима. "
-            + "Короткий список допустимых источников и разделов:\n"
+            "Не включай сухие справки, вечнозеленые гайды, рекламу услуг, криминал, спорт, вакансии, общую политику "
+            "без прямого миграционного эффекта. "
+            "Если по одной стране есть два сильных изменения, это допустимо, но в целом сначала стремись к разным странам. "
+            "Короткий список допустимых источников и разделов:\n"
             + f"{source_profiles}\n"
-            "Для каждого пункта укажи: дату, страну, одно короткое и понятное описание сути изменения, "
-            "и источник в формате: Оригинал статьи: домен, URL. "
-            "Формат ответа: простой текст без Markdown, нумерованный список вида "
-            "\"1) Страна: Заголовок — дата. Одно короткое описание. Оригинал статьи: домен, https://...\". "
-            "Предпочитай разнообразие по странам: сначала разные страны/юрисдикции, и только затем второй пункт по той же стране, "
-            "если это отдельное сильное изменение другого типа. "
-            "Пиши живо и читабельно, без канцелярита и сухих юридических формулировок. "
-            "Каждый пункт должен быть примерно в 2 раза короче обычной заметки: только суть изменения, без блока 'Почему важно', "
-            "без 'Кратко', без вступления, преамбулы, общего абзаца перед списком и без заключения после списка. "
-            "Не дублируй один и тот же сюжет, страну+событие или один и тот же источник по одной теме. Выведи только нумерованный список. "
-            "Не останавливайся после первых 2-3 найденных публикаций: сначала попробуй собрать более широкую и интересную выборку по всем допустимым доменам. "
-            "Если статья не проходит хотя бы по двум позитивным признакам или попадает под негативные признаки, не включай ее. "
-            "Не используй Wikipedia или любые вики-источники. "
-            "Если релевантных новостей меньше 6, просто верни меньше пунктов без дополнительных объяснений."
+            "Верни только нумерованный список без вступления и без заключения. "
+            "Строгий формат каждого пункта:\n"
+            "1) Страна: Заголовок — дата. Одно короткое описание в 1-2 предложениях.\n"
+            "Оригинал статьи: домен, https://полная-ссылка-на-статью\n"
+            "Не пиши 'Кратко', 'Почему важно', 'Примечание', 'не найдено', 'выборка ограничена'. "
+            "Не переноси год на отдельную строку и не разрывай дату. "
+            "Если релевантных новостей меньше 10, верни сколько есть, но сначала постарайся собрать 10."
         )
 
     domain_rule = (
-        "Use these domains as the primary source pool: "
-        f"{', '.join(allowed_domains)}. Try to use at least 3 different domains when enough relevant material exists. "
-        "Do not use more than 2 items from the same domain if a more diverse selection is available. "
-        "If the pool is too limited, explicitly say so instead of filling the list with unrelated items."
+        "Use only this source pool: "
+        f"{', '.join(allowed_domains)}. Try to build the list from different sites and countries first."
         if allowed_domains else
-        "Use several independent news or official sources instead of relying on a single site."
+        "Use several independent sources instead of one site."
     )
     return (
-        "Prepare a summary of 8-10 items only about migration law, migration policy, and legal status changes "
-        "relevant to Russian relocators. "
+        f"Prepare a summary of {TARGET_NEWS_ITEMS} news items for Russian relocators. "
         f"Publication date range: {start_date.isoformat()} to {today.isoformat()}. "
-        "Include only changes to visas, residence permits, permanent residence, citizenship, asylum, work or "
-        "business migration, study routes, digital nomad programs, family reunion, repatriation, and consular "
-        "or sanctions-related restrictions if they affect travel, entry, legalization, or residence for Russian "
-        "citizens abroad. Exclude crime, accidents, economy, sports, vacancies, generic domestic politics, and "
-        "anything not materially relevant to Russian relocators. "
+        "Topics: visas, residence permits, citizenship, entry rules, work and study migration, digital nomads, "
+        "family reunion, legalization, and consular restrictions. Prioritize countries outside Russia. "
+        "Include Russia-based news only when it directly affects Russians already abroad or preparing relocation. "
         f"{domain_rule} "
-        "First filter candidates by source, URL/path, section, and keywords. "
-        f"Global positive keywords: {positive_keywords}. "
-        f"Global negative keywords: {negative_keywords}. "
-        "Exclude evergreen guides, SEO explainers, service-marketing pages, rankings, and static overviews unless "
-        "they clearly describe a fresh law, policy, or procedure change in the target date range. "
-        + "Compact source list and allowed sections:\n"
+        "Exclude evergreen guides, service marketing, crime, sports, vacancies, and generic politics without a direct migration impact. "
+        "If one country has two strong developments, that is acceptable, but aim for country diversity first. "
+        + "Allowed source list and sections:\n"
         + f"{source_profiles}\n"
-        "For each item provide the date, country, one short and readable summary of the change, "
-        "and a source in the format: Original article: domain, URL. "
-        "Answer in plain text without Markdown as a numbered list like "
-        "\"1) Country: Title — date. One short description. Original article: domain, https://...\". "
-        "Prefer country diversity: cover different countries/jurisdictions first, and only then include a second item "
-        "from the same country if it is a separate strong policy change of another type. "
-        "Write in a readable human style, not dry bureaucratic prose. Each item should be about half the length of a normal brief: "
-        "only the core change, no 'Why it matters' block, no 'Summary' label, no intro, and no closing note. "
-        "Do not include duplicate events, duplicate country+event pairs, or the same story twice. Output only the numbered list. "
-        "Do not stop after the first 2-3 matches: try to build a broader and more interesting mix across the allowed domains first. "
-        "If an article does not satisfy at least two positive signals or hits negative signals, exclude it. "
-        "Do not use Wikipedia or other wiki sources. "
-        "If fewer than 6 relevant items exist, just return fewer items without additional explanation."
+        "Return only a numbered list with no intro and no closing note. "
+        "Strict format for each item:\n"
+        "1) Country: Title — date. One short description in 1-2 sentences.\n"
+        "Original article: domain, https://full-article-url\n"
+        "Do not write 'Summary', 'Why it matters', 'Note', or 'limited source pool'. "
+        "Do not put the year on a separate line and do not break the date. "
+        "If fewer than 10 relevant items exist, return fewer, but first try to collect 10."
     )
 
 # ---------------------------------------------
@@ -682,29 +652,48 @@ def sanitize_plain_text(text, preserve_urls=False):
     return text.strip()
 
 
+def normalize_news_response_text(text):
+    if not text:
+        return ""
+
+    text = sanitize_plain_text(text, preserve_urls=True)
+    text = re.sub(r"\b(Источник|Оригинал статьи|Source|Original article):\s+", r"\1: ", text, flags=re.I)
+    text = re.sub(
+        r"—\s*(\d{1,2}\s+[A-Za-zА-Яа-яЁё]+)\s*\n+\s*(20\d{2})\b",
+        r"— \1 \2",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(r"\(([a-z0-9.-]+\.[a-z]{2,})", r"\1", text, flags=re.I)
+    first_item = re.search(r"^\s*\d+[\).]\s+", text, flags=re.M)
+    if first_item:
+        text = text[first_item.start():]
+    return text.strip()
+
+
+def split_numbered_news_blocks(text):
+    normalized = normalize_news_response_text(text)
+    if not normalized:
+        return []
+    return [
+        match.group(0).strip()
+        for match in re.finditer(r"(?ms)^\s*\d+[\).]\s+.*?(?=^\s*\d+[\).]\s+|\Z)", normalized)
+    ]
+
+
 def parse_news_items(text):
     if not text:
         return []
 
-    normalized = sanitize_plain_text(text, preserve_urls=True)
-    normalized = re.sub(r"(?<!\n)\s+(?=\d+[\).]\s+)", "\n", normalized)
-    lines = [ln.strip() for ln in normalized.splitlines() if ln.strip()]
+    blocks = split_numbered_news_blocks(text)
+    if not blocks:
+        return []
+
     items = []
-    current = []
-    seen_numbered_item = False
-    for ln in lines:
-        if re.match(r"^\d+[\).]\s+", ln):
-            seen_numbered_item = True
-            if current:
-                items.append(" ".join(current).strip())
-                current = []
-        elif not seen_numbered_item:
-            continue
-        current.append(ln)
-
-    if current:
-        items.append(" ".join(current).strip())
-
+    for block in blocks:
+        normalized_block = re.sub(r"\s*\n+\s*", " ", block).strip()
+        if normalized_block:
+            items.append(normalized_block)
     return items
 
 
@@ -837,9 +826,31 @@ def needs_news_retry(text):
 def needs_news_diversity_retry(text):
     items = parse_news_items(text)
     domains = {domain for domain in get_news_item_domains(text) if domain}
-    if len(items) < 4:
+    if len(items) < 8:
         return True
     if len(domains) < 2 and len(items) >= 2:
+        return True
+    return False
+
+
+def needs_news_format_retry(text):
+    items = parse_news_items(text)
+    if len(items) < 8:
+        return True
+
+    malformed = 0
+    missing_links = 0
+    for item in items:
+        cleaned = clean_news_item_text(item)
+        source = extract_source_info(item)
+        if not cleaned or re.match(r"^(19|20)\d{2}\b", cleaned):
+            malformed += 1
+        if not source.get("url"):
+            missing_links += 1
+
+    if malformed > 0:
+        return True
+    if missing_links >= len(items):
         return True
     return False
 
@@ -996,6 +1007,66 @@ def collect_response_citations(response):
     return citations
 
 
+def collect_output_text_annotations(response):
+    payload = response_to_dict(response)
+    output = payload.get("output", [])
+    collected = []
+
+    for item in output:
+        if item.get("type") != "message":
+            continue
+        for content in item.get("content", []):
+            if content.get("type") != "output_text":
+                continue
+            text = content.get("text") or ""
+            annotations = content.get("annotations") or []
+            collected.append({"text": text, "annotations": annotations})
+
+    return collected
+
+
+def map_item_urls_from_annotations(response):
+    text_parts = collect_output_text_annotations(response)
+    if not text_parts:
+        return []
+
+    full_text = ""
+    annotations = []
+    offset = 0
+
+    for part in text_parts:
+        part_text = part["text"]
+        full_text += part_text
+        for ann in part["annotations"]:
+            url = ann.get("url")
+            if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+                continue
+            start = ann.get("start_index")
+            end = ann.get("end_index")
+            if isinstance(start, int):
+                start += offset
+            if isinstance(end, int):
+                end += offset
+            annotations.append({"url": url, "start": start, "end": end, "domain": normalize_host(url)})
+        offset += len(part_text)
+
+    blocks = [
+        (match.start(), match.end(), match.group(0).strip())
+        for match in re.finditer(r"(?ms)^\s*\d+[\).]\s+.*?(?=^\s*\d+[\).]\s+|\Z)", full_text)
+    ]
+    item_urls = []
+    for start, end, _block in blocks:
+        chosen = None
+        for ann in annotations:
+            ann_start = ann.get("start")
+            if isinstance(ann_start, int) and start <= ann_start < end:
+                chosen = ann
+                break
+        item_urls.append(chosen)
+
+    return item_urls
+
+
 def add_url_to_news_item(item_text, citation_url, citation_domain):
     if not citation_url or citation_url in item_text:
         return item_text
@@ -1019,8 +1090,9 @@ def enrich_news_text_with_citations(text, response):
     if not text:
         return text
 
+    item_citations = map_item_urls_from_annotations(response)
     citations = collect_response_citations(response)
-    if not citations:
+    if not citations and not item_citations:
         return text
 
     items = parse_news_items(text)
@@ -1030,9 +1102,15 @@ def enrich_news_text_with_citations(text, response):
     used_urls = set()
     enriched_items = []
 
-    for item in items:
+    for index, item in enumerate(items):
         if re.search(r"https?://", item, flags=re.I):
             enriched_items.append(item)
+            continue
+
+        matched = item_citations[index] if index < len(item_citations) else None
+        if matched and matched.get("url"):
+            used_urls.add(matched["url"])
+            enriched_items.append(add_url_to_news_item(item, matched["url"], matched["domain"]))
             continue
 
         item_domain = extract_news_item_domain(item)
@@ -1087,7 +1165,7 @@ def extract_source_info(item_text):
     source_text = source_match.group(1).strip() if source_match else ""
     url_match = re.search(r"https?://\S+", source_text or item_text, flags=re.I)
     url = url_match.group(0).rstrip(").,;") if url_match else ""
-    domain = extract_news_item_domain(source_text or item_text)
+    domain = extract_news_item_domain(source_text or item_text).strip("()[]{}.,;: ")
 
     if not domain and url:
         parsed = urlparse(url)
@@ -1096,8 +1174,12 @@ def extract_source_info(item_text):
     return {"url": url, "domain": domain}
 
 
+def strip_item_number(item_text):
+    return re.sub(r"^\s*\d+[\).]\s*", "", item_text or "").strip()
+
+
 def clean_news_item_text(item_text):
-    text = sanitize_plain_text(item_text, preserve_urls=True)
+    text = strip_item_number(sanitize_plain_text(item_text, preserve_urls=True))
     text = re.sub(r"\s*(Кратко|Summary):\s*", " ", text, flags=re.I)
     text = re.sub(
         r"\s*(Почему важно|Why it matters):.*?(?=(Оригинал статьи|Источник|Original article|Source):|$)",
@@ -1116,6 +1198,14 @@ def clean_news_item_text(item_text):
     text = re.sub(r"^\s*Количество релевантных материалов.*?:\s*", "", text, flags=re.I)
     text = re.sub(r"\bУвы,.*$", "", text, flags=re.I)
     text = re.sub(r"\bПримечание:.*$", "", text, flags=re.I)
+    text = re.sub(
+        r"—\s*(\d{1,2}\s+[A-Za-zА-Яа-яЁё]+)\s+(20\d{2})\.",
+        r"— \1 \2.",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(r"\b20\d{2}\.\s+(?=[А-ЯЁA-Z])", "", text)
+    text = re.sub(r"\s+\(([a-z0-9.-]+\.[a-z]{2,})\)?", "", text, flags=re.I)
     text = re.sub(r"\s{2,}", " ", text)
     text = text.strip(" \n\t-—,;.")
 
@@ -1126,10 +1216,10 @@ def clean_news_item_text(item_text):
     return text
 
 
-def render_news_item_html(item_text, lang):
+def render_news_item_html(item_text, lang, index):
     cleaned = clean_news_item_text(item_text)
     source = extract_source_info(item_text)
-    body = escape_html(cleaned)
+    body = escape_html(f"{index}) {cleaned}")
     source_label = "Оригинал статьи" if lang == "ru" else "Original article"
     link_label = "ссылка на оригинал" if lang == "ru" else "original link"
 
@@ -1159,8 +1249,8 @@ def format_news_html(text, lang):
     items = dedupe_news_items(parse_news_items(text))
 
     formatted = []
-    for raw in items:
-        rendered = render_news_item_html(raw, lang)
+    for index, raw in enumerate(items, start=1):
+        rendered = render_news_item_html(raw, lang, index)
         if rendered:
             formatted.append(rendered)
 
@@ -1387,12 +1477,27 @@ def process_news_request(chat_id, lang, trigger_text):
                 if not is_service_message(raw_ans, lang) and needs_news_diversity_retry(raw_ans):
                     diversity_prompt = (
                         initial_prompt
-                        + "\nВерни более разнообразную подборку: минимум 4 пункта и минимум 3 разных домена, "
-                          "если это возможно по указанным источникам. Не ограничивайся только DW или одним сайтом."
+                        + "\nСобери более полную подборку: стремись к 10 пунктам, минимум к 8, и используй разные страны и домены, "
+                          "если это возможно. Не ограничивайся одним сайтом."
                     )
                     raw_ans = generate_answer(
                         chat_id,
                         diversity_prompt,
+                        lang,
+                        use_history=False,
+                        news_mode=True
+                    )
+                if not is_service_message(raw_ans, lang) and needs_news_format_retry(raw_ans):
+                    format_prompt = (
+                        initial_prompt
+                        + "\nПереформатируй ответ строго по шаблону. Каждый пункт только в 2 строках: "
+                          "\"1) Страна: Заголовок — дата. Одно короткое описание.\" и на новой строке "
+                          "\"Оригинал статьи: домен, https://полная-ссылка\". "
+                          "Не начинай новый абзац с года, не оставляй голый домен без полной ссылки, не добавляй вступление или заключение."
+                    )
+                    raw_ans = generate_answer(
+                        chat_id,
+                        format_prompt,
                         lang,
                         use_history=False,
                         news_mode=True
