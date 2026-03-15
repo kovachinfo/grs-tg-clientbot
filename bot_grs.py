@@ -35,8 +35,14 @@ TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 OPENAI_NEWS_MODEL = os.getenv("OPENAI_NEWS_MODEL", "").strip()
+OPENAI_ENABLE_NEWS_FILTERS = os.getenv("OPENAI_ENABLE_NEWS_FILTERS", "false").lower() == "true"
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+try:
+    OPENAI_TIMEOUT_SEC = float(os.getenv("OPENAI_TIMEOUT_SEC", "45"))
+except ValueError:
+    OPENAI_TIMEOUT_SEC = 45.0
+
+client = OpenAI(api_key=OPENAI_API_KEY, timeout=OPENAI_TIMEOUT_SEC)
 
 # ---------------------------------------------
 # Тексты и настройки
@@ -46,6 +52,12 @@ MAX_HISTORY_MESSAGES = 10
 NEWS_CACHE_TTL_SEC = 24 * 60 * 60
 TELEGRAM_MAX_MESSAGE_LEN = 4096
 REQUEST_TIMEOUT_SEC = 15
+PROCESSED_UPDATE_TTL_SEC = 10 * 60
+
+processed_updates = {}
+processed_updates_lock = threading.Lock()
+active_news_jobs = set()
+active_news_jobs_lock = threading.Lock()
 
 
 def get_int_env(name, default):
@@ -224,7 +236,9 @@ print(
     f"openai_sdk={get_package_version('openai')} "
     f"openai_model={OPENAI_MODEL} "
     f"openai_news_model={OPENAI_NEWS_MODEL or '<empty>'} "
-    f"news_lookback_days={NEWS_LOOKBACK_DAYS}",
+    f"news_lookback_days={NEWS_LOOKBACK_DAYS} "
+    f"openai_timeout_sec={OPENAI_TIMEOUT_SEC} "
+    f"news_filters_enabled={OPENAI_ENABLE_NEWS_FILTERS}",
     flush=True,
 )
 
@@ -267,6 +281,29 @@ TEXTS = {
 
 def parse_config_list(raw_value):
     return [item.strip() for item in re.split(r"[\n,;]+", raw_value or "") if item.strip()]
+
+
+def cleanup_processed_updates(now_ts=None):
+    now_ts = now_ts or time.time()
+    expired = [
+        update_id for update_id, ts in processed_updates.items()
+        if now_ts - ts > PROCESSED_UPDATE_TTL_SEC
+    ]
+    for update_id in expired:
+        processed_updates.pop(update_id, None)
+
+
+def is_duplicate_update(update_id):
+    if update_id is None:
+        return False
+
+    now_ts = time.time()
+    with processed_updates_lock:
+        cleanup_processed_updates(now_ts)
+        if update_id in processed_updates:
+            return True
+        processed_updates[update_id] = now_ts
+    return False
 
 
 def normalize_domain(value):
@@ -406,7 +443,7 @@ def build_news_prompt(lang, compact=False):
             "Используй несколько независимых новостных или официальных источников, а не один сайт."
         )
         return (
-            "Подготовь сводку из 6-10 пунктов только по миграционному праву, миграционной политике и "
+            "Подготовь сводку из 6-8 пунктов только по миграционному праву, миграционной политике и "
             "процедурам легализации, которые важны для релокантов из России. "
             f"Период публикации: с {start_date.isoformat()} по {today.isoformat()}. "
             "Включай только новости об изменениях виз, ВНЖ/ПМЖ, гражданства, убежища, трудовой или "
@@ -431,6 +468,8 @@ def build_news_prompt(lang, compact=False):
             "и источник в формате: Источник: Название статьи, домен. "
             "Формат ответа: простой текст без Markdown, нумерованный список вида "
             "\"1) Заголовок — дата. Короткое описание. Почему важно: ... Источник: Название статьи, домен\". "
+            "Пиши компактно: каждый пункт максимум 2 коротких предложения после заголовка, примерно на 20% короче обычной новости, "
+            "без потери ключевого смысла. Не дублируй один и тот же сюжет, страну+событие или один и тот же источник по одной теме. "
             "Если статья не проходит хотя бы по двум позитивным признакам или попадает под негативные признаки, не включай ее. "
             "Не используй Wikipedia или любые вики-источники. Не давай прямые ссылки. "
             "Если релевантных новостей меньше 6, верни меньше и явно сообщи, что значимых материалов мало."
@@ -444,7 +483,7 @@ def build_news_prompt(lang, compact=False):
         "Use several independent news or official sources instead of relying on a single site."
     )
     return (
-        "Prepare a 6-10 item summary only about migration law, migration policy, and legal status changes "
+        "Prepare a 6-8 item summary only about migration law, migration policy, and legal status changes "
         "relevant to Russian relocators. "
         f"Publication date range: {start_date.isoformat()} to {today.isoformat()}. "
         "Include only changes to visas, residence permits, permanent residence, citizenship, asylum, work or "
@@ -468,6 +507,8 @@ def build_news_prompt(lang, compact=False):
         "and a source in the format: Source: Article title, domain. "
         "Answer in plain text without Markdown as a numbered list like "
         "\"1) Title — date. Short description. Why it matters: ... Source: Article title, domain\". "
+        "Be concise: each item should be at most 2 short sentences after the title, about 20% shorter than a typical news brief, "
+        "without losing the key meaning. Do not include duplicate events, duplicate country+event pairs, or the same story twice. "
         "If an article does not satisfy at least two positive signals or hits negative signals, exclude it. "
         "Do not use Wikipedia or other wiki sources. Do not include direct links. "
         "If fewer than 6 relevant items exist, return fewer and explicitly say the pool was limited."
@@ -615,7 +656,76 @@ def sanitize_plain_text(text):
     text = re.sub(r"\[(.*?)\]\((.*?)\)", r"\1 — \2", text)
     text = re.sub(r"https?://\S+", "", text)
     text = re.sub(r"^\s*[-*]\s+", "- ", text, flags=re.M)
+    text = re.sub(r"\b([a-z0-9.-]+\.[a-z]{2,})\.\s+\(\1\b", r"\1 (", text, flags=re.I)
+    text = re.sub(r"\s{2,}", " ", text)
     return text.strip()
+
+
+def parse_news_items(text):
+    if not text:
+        return []
+
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    items = []
+    current = []
+    for ln in lines:
+        if re.match(r"^\d+[\).]\s+", ln):
+            if current:
+                items.append(" ".join(current).strip())
+                current = []
+        current.append(ln)
+
+    if current:
+        items.append(" ".join(current).strip())
+
+    return items
+
+
+def normalize_news_item_key(item_text):
+    text = re.sub(r"^\d+[\).]\s*", "", item_text.strip().lower())
+    title = re.split(r"\s+почему важно:|\s+источник:", text, maxsplit=1)[0]
+    title = re.sub(r"\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b", " ", title)
+    title = re.sub(r"\b\d{4}\b", " ", title)
+    title = re.sub(r"[^a-zа-я0-9]+", " ", title, flags=re.I)
+    title = re.sub(r"\s+", " ", title).strip()
+    words = title.split()
+    return " ".join(words[:12])
+
+
+def dedupe_news_items(items):
+    deduped = []
+    seen = set()
+
+    for item in items:
+        key = normalize_news_item_key(item)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+
+    return deduped[:8]
+
+
+def compress_news_item_text(item_text):
+    text = item_text
+    sentence_patterns = [
+        r"[^.!?]*финальн[^.!?]*решени[^.!?]*[.!?]?",
+        r"[^.!?]*решени[яе]\s+принима(ет|ют)[^.!?]*[.!?]?",
+        r"[^.!?]*компетентн[^.!?]*орган[^.!?]*[.!?]?",
+    ]
+    for pattern in sentence_patterns:
+        text = re.sub(pattern, " ", text, flags=re.I)
+
+    text = re.sub(r"\s{2,}", " ", text)
+    text = re.sub(r"\s+([,.;:])", r"\1", text)
+    return text.strip()
+
+
+def enforce_news_spacing(text):
+    items = [compress_news_item_text(item) for item in dedupe_news_items(parse_news_items(text))]
+    if not items:
+        return text.strip()
+    return "\n\n".join(items).strip()
 
 def needs_news_retry(text):
     if not text:
@@ -649,7 +759,7 @@ def is_invalid_cached_news(text):
 
 def build_web_search_tool(news_mode=False, include_filters=True):
     tool = {"type": "web_search", "search_context_size": "medium"}
-    if news_mode and include_filters:
+    if news_mode and include_filters and OPENAI_ENABLE_NEWS_FILTERS:
         allowed_domains = get_allowed_news_domains()
         if allowed_domains:
             tool["filters"] = {"allowed_domains": allowed_domains}
@@ -661,7 +771,7 @@ def get_response_models(news_mode=False):
         return [OPENAI_MODEL]
 
     candidates = []
-    for model in [OPENAI_NEWS_MODEL, OPENAI_MODEL, "gpt-5", "o4-mini"]:
+    for model in [OPENAI_NEWS_MODEL, OPENAI_MODEL]:
         if model and model not in candidates:
             candidates.append(model)
     return candidates
@@ -671,10 +781,13 @@ def get_tool_variants(news_mode=False):
     if not news_mode:
         return [("default", build_web_search_tool(news_mode=False))]
 
-    return [
-        ("filtered", build_web_search_tool(news_mode=True, include_filters=True)),
-        ("unfiltered", build_web_search_tool(news_mode=True, include_filters=False)),
-    ]
+    if OPENAI_ENABLE_NEWS_FILTERS:
+        return [
+            ("filtered", build_web_search_tool(news_mode=True, include_filters=True)),
+            ("unfiltered", build_web_search_tool(news_mode=True, include_filters=False)),
+        ]
+
+    return [("unfiltered", build_web_search_tool(news_mode=True, include_filters=False))]
 
 
 def create_response(messages, lang="ru", news_mode=False):
@@ -737,28 +850,23 @@ def format_news_html(text, lang):
         if lang == "ru"
         else "🧭 <b>News for Russian Relocators</b>"
     )
+    footer = (
+        "Примечание: окончательные решения по визам и статусам принимают государственные органы соответствующих стран."
+        if lang == "ru"
+        else "Note: final decisions on visas and status matters are made by the relevant state authorities."
+    )
     if not text:
-        return header
+        return f"{header}\n\n{escape_html(footer)}"
 
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    items = []
-    current = []
-    for ln in lines:
-        if re.match(r"^\d+[\).]\s+", ln):
-            if current:
-                items.append(" ".join(current))
-                current = []
-        current.append(ln)
-    if current:
-        items.append(" ".join(current))
+    items = dedupe_news_items(parse_news_items(text))
 
     formatted = []
     for raw in items:
         escaped = escape_html(raw)
         formatted.append(bold_title(escaped))
 
-    body = "\n".join(formatted) if formatted else escape_html(text)
-    return f"{header}\n\n{body}".strip()
+    body = "\n\n".join(formatted) if formatted else escape_html(text)
+    return f"{header}\n\n{body}\n\n{escape_html(footer)}".strip()
 
 
 def split_message_chunks(text, limit=TELEGRAM_MAX_MESSAGE_LEN):
@@ -928,14 +1036,77 @@ def send_chat_action(chat_id, action="typing"):
         payload = {"chat_id": chat_id, "action": action}
         resp = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT_SEC)
         if not resp.ok:
-            logger.error("Chat Action Error: %s %s", resp.status_code, resp.text)
+            if resp.status_code == 429:
+                logger.warning("Chat Action rate limited: %s", resp.text)
+            else:
+                logger.error("Chat Action Error: %s %s", resp.status_code, resp.text)
     except Exception as e:
         logger.error(f"Chat Action Error: {e}")
 
-def run_typing(chat_id, stop_event, interval_sec=2):
+def run_typing(chat_id, stop_event, interval_sec=4):
     while not stop_event.is_set():
         send_chat_action(chat_id, "typing")
         stop_event.wait(interval_sec)
+
+
+def make_news_job_key(chat_id, lang):
+    return f"{chat_id}:{lang}"
+
+
+def process_news_request(chat_id, lang, trigger_text):
+    job_key = make_news_job_key(chat_id, lang)
+    stop_event = threading.Event()
+    typing_thread = threading.Thread(
+        target=run_typing,
+        args=(chat_id, stop_event),
+        daemon=True
+    )
+    typing_thread.start()
+
+    try:
+        try:
+            cached = get_cached_news(lang)
+            if cached:
+                ans = cached
+            else:
+                raw_ans = generate_answer(
+                    chat_id,
+                    build_news_prompt(lang),
+                    lang,
+                    use_history=False,
+                    news_mode=True
+                )
+                if is_service_message(raw_ans, lang):
+                    compact_prompt = build_news_prompt(lang, compact=True)
+                    print(
+                        "News retry with compact prompt "
+                        f"chat_id={chat_id} lang={lang} prompt_chars={len(compact_prompt)}",
+                        flush=True,
+                    )
+                    raw_ans = generate_answer(
+                        chat_id,
+                        compact_prompt,
+                        lang,
+                        use_history=False,
+                        news_mode=True
+                    )
+                if is_service_message(raw_ans, lang):
+                    ans = raw_ans
+                else:
+                    normalized_news = enforce_news_spacing(sanitize_plain_text(raw_ans))
+                    ans = format_news_html(normalized_news, lang)
+                    save_cached_news(lang, ans)
+        except Exception:
+            logger.exception("Unhandled error in process_news_request chat_id=%s lang=%s", chat_id, lang)
+            ans = TEXTS[lang]["error"]
+
+        save_message(chat_id, "user", trigger_text)
+        save_message(chat_id, "assistant", ans)
+        send_message(chat_id, ans, parse_mode="HTML")
+    finally:
+        stop_event.set()
+        with active_news_jobs_lock:
+            active_news_jobs.discard(job_key)
 
 def get_main_keyboard(lang):
     t = TEXTS[lang]
@@ -971,6 +1142,12 @@ def webhook():
     if not data or "message" not in data:
         return "ok"
 
+    update_id = data.get("update_id")
+    if is_duplicate_update(update_id):
+        logger.info("Skipping duplicate Telegram update_id=%s", update_id)
+        print(f"Skipping duplicate Telegram update_id={update_id}", flush=True)
+        return "ok"
+
     msg = data["message"]
     chat_id = msg.get("chat", {}).get("id")
     text = msg.get("text", "")
@@ -992,6 +1169,7 @@ def webhook():
     t = TEXTS[lang]
     ru_t = TEXTS["ru"]
     en_t = TEXTS["en"]
+    skip_search_notice = False
 
     # 2. Обработка команд и кнопок
     if text == "/start":
@@ -1002,6 +1180,7 @@ def webhook():
         clear_cached_news(lang)
         send_message(chat_id, t["searching"])
         text = t["btn_news"]
+        skip_search_notice = True
 
     # Смена языка
     if text == TEXTS["ru"]["btn_ru"] or text == "🇷🇺 Русский":
@@ -1029,56 +1208,25 @@ def webhook():
         if user['request_count'] >= MAX_FREE_REQUESTS and not user.get('is_premium'):
             send_message(chat_id, t["limit_reached"])
             return "ok"
-        
-        send_message(chat_id, t["searching"])
+
+        job_key = make_news_job_key(chat_id, lang)
+        with active_news_jobs_lock:
+            if job_key in active_news_jobs:
+                logger.info("News job already active for %s", job_key)
+                print(f"News job already active for {job_key}", flush=True)
+                return "ok"
+            active_news_jobs.add(job_key)
+
+        if not skip_search_notice:
+            send_message(chat_id, t["searching"])
         increment_request_count(chat_id)
 
-        send_chat_action(chat_id, "typing")
-        stop_event = threading.Event()
-        typing_thread = threading.Thread(
-            target=run_typing,
-            args=(chat_id, stop_event),
+        worker = threading.Thread(
+            target=process_news_request,
+            args=(chat_id, lang, text),
             daemon=True
         )
-        typing_thread.start()
-
-        try:
-            cached = get_cached_news(lang)
-            if cached:
-                ans = cached
-            else:
-                raw_ans = generate_answer(
-                    chat_id,
-                    build_news_prompt(lang),
-                    lang,
-                    use_history=False,
-                    news_mode=True
-                )
-                if is_service_message(raw_ans, lang):
-                    compact_prompt = build_news_prompt(lang, compact=True)
-                    print(
-                        "News retry with compact prompt "
-                        f"chat_id={chat_id} lang={lang} prompt_chars={len(compact_prompt)}",
-                        flush=True,
-                    )
-                    raw_ans = generate_answer(
-                        chat_id,
-                        compact_prompt,
-                        lang,
-                        use_history=False,
-                        news_mode=True
-                    )
-                if is_service_message(raw_ans, lang):
-                    ans = raw_ans
-                else:
-                    ans = format_news_html(raw_ans, lang)
-                    save_cached_news(lang, ans)
-        finally:
-            stop_event.set()
-        
-        save_message(chat_id, "user", text) 
-        save_message(chat_id, "assistant", ans)
-        send_message(chat_id, ans, parse_mode="HTML")
+        worker.start()
         return "ok"
 
     # 3. Обработка обычного текстового запроса (ChatGPT)
