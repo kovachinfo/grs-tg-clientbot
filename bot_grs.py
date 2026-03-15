@@ -4,6 +4,8 @@ import requests
 import time
 import threading
 import re
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from flask import Flask, request
@@ -31,6 +33,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+OPENAI_NEWS_MODEL = os.getenv("OPENAI_NEWS_MODEL", "").strip()
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -43,6 +46,171 @@ NEWS_CACHE_TTL_SEC = 24 * 60 * 60
 TELEGRAM_MAX_MESSAGE_LEN = 4096
 REQUEST_TIMEOUT_SEC = 15
 
+
+def get_int_env(name, default):
+    try:
+        value = int(os.getenv(name, str(default)))
+        return max(1, value)
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s=%r, using default=%s", name, os.getenv(name), default)
+        return default
+
+
+NEWS_LOOKBACK_DAYS = get_int_env("NEWS_LOOKBACK_DAYS", 120)
+NEWS_ALLOWED_DOMAINS_RAW = os.getenv("NEWS_ALLOWED_DOMAINS", "")
+NEWS_SOURCE_URLS_RAW = os.getenv("NEWS_SOURCE_URLS", "")
+
+DEFAULT_NEWS_SOURCE_PROFILES = [
+    {
+        "domain": "immigrantinvest.com",
+        "label": "Immigrant Invest",
+        "allowed_paths": [
+            "/ru/blog/category/residence-permit/",
+            "/ru/blog/category/citizenship/",
+            "/ru/blog/category/permanent-residency/"
+        ],
+        "section_hints": ["ВНЖ", "Гражданство", "ПМЖ"],
+        "positive_keywords": [
+            "внж", "пмж", "гражданство", "золотая виза", "golden visa",
+            "residence permit", "permanent residency", "digital nomad",
+            "инвестиции", "натурализация", "воссоединение семьи"
+        ],
+        "negative_keywords": [
+            "истории клиентов", "недвижимость для отдыха", "налоги", "банки",
+            "медицина", "туризм", "путешествия", "рейтинг без события"
+        ],
+        "requires_event_language": True,
+    },
+    {
+        "domain": "espassport.pro",
+        "label": "Первый иммиграционный центр",
+        "allowed_paths": ["/news/"],
+        "section_hints": ["Блог > Новости"],
+        "positive_keywords": [
+            "виза", "внж", "пмж", "гражданство", "золотая виза",
+            "digital nomad", "иммиграц", "легализац", "релокац",
+            "россиян", "граждан рф"
+        ],
+        "negative_keywords": [
+            "роды", "работа в испании без привязки к правилам", "отзывы",
+            "кейсы клиентов", "услуги компании", "гарантия", "стоимость услуг"
+        ],
+        "requires_event_language": True,
+    },
+    {
+        "domain": "confidencegroup.ru",
+        "label": "Confidence Group",
+        "allowed_paths": ["/info/articles/"],
+        "section_hints": [
+            "Статьи > Миграционные услуги",
+            "Статьи > Визовая поддержка",
+            "Статьи > Высококвалифицированные специалисты"
+        ],
+        "positive_keywords": [
+            "виза", "внж", "рвп", "гражданство", "уведомлен", "консульств",
+            "проживающих за рубежом", "иностранн", "миграционн", "закон",
+            "мвд", "минтруд", "законопроект"
+        ],
+        "negative_keywords": [
+            "патент на работу", "привлечение иностранных работников в рф",
+            "кадровый учет", "сим-карта", "регистрация работодателя",
+            "аккредитация", "въезд в рф без связи с релокантами"
+        ],
+        "requires_russian_relocator_angle": True,
+    },
+    {
+        "domain": "pravo.ru",
+        "label": "Право.ру",
+        "allowed_paths": ["/news/", "/story/"],
+        "section_hints": ["Законодательство", "Практика", "Международная практика"],
+        "positive_keywords": [
+            "внж", "второе гражданство", "гражданство", "уведомлен",
+            "законопроект", "закон", "миграцион", "консульств", "проживающих за рубежом"
+        ],
+        "negative_keywords": [
+            "корпоратив", "банкрот", "арбитраж", "налоговый спор",
+            "реклама", "ip", "фарма", "ваканси"
+        ],
+        "requires_russian_relocator_angle": True,
+    },
+    {
+        "domain": "rbc.ru",
+        "label": "РБК",
+        "allowed_paths": ["/politics/", "/society/", "/rbcfreenews/", "/economics/", "/radio/"],
+        "section_hints": ["Политика", "Общество", "Экономика", "Радио"],
+        "positive_keywords": [
+            "внж", "гражданство", "золотая виза", "виза", "релокац",
+            "россиян", "иностранц", "депортац", "вид на жительство",
+            "второе гражданство", "миграцион"
+        ],
+        "negative_keywords": [
+            "companies.rbc.ru", "pro.rbc.ru", "недвижимость без регуляторного изменения",
+            "рынок жилья без визового эффекта", "криминал", "спорт"
+        ],
+        "requires_event_language": True,
+    },
+    {
+        "domain": "kommersant.ru",
+        "label": "Коммерсантъ",
+        "allowed_paths": ["/doc/"],
+        "section_hints": ["Новости / doc"],
+        "positive_keywords": [
+            "внж", "второе гражданство", "гражданство", "уведомлен",
+            "миграцион", "законопроект", "закон", "проживающих за рубежом"
+        ],
+        "negative_keywords": [
+            "бизнес", "нефть", "спорт", "криминал", "рынки", "суд без миграционного сюжета"
+        ],
+        "requires_russian_relocator_angle": True,
+    },
+    {
+        "domain": "dw.com",
+        "label": "DW на русском",
+        "allowed_paths": ["/ru/"],
+        "section_hints": ["Иностранцы", "Грузия", "Европа", "Политика", "Общество"],
+        "positive_keywords": [
+            "внж", "гражданство", "виза", "депортац", "выдворен",
+            "иностранц", "грузи", "латви", "финлянд", "европа",
+            "россиян", "проживание", "легализац"
+        ],
+        "negative_keywords": [
+            "культура", "медиа", "выборы без миграционного эффекта",
+            "протесты без изменения правил пребывания"
+        ],
+        "requires_event_language": True,
+    },
+    {
+        "domain": "rus.err.ee",
+        "label": "ERR на русском",
+        "allowed_paths": ["/"],
+        "section_hints": ["За рубежом", "Эстония"],
+        "positive_keywords": [
+            "внж", "гражданство", "миграционн", "квота", "депортац",
+            "россиян", "иностранц", "эстони", "латви", "финлянд",
+            "уведомлен", "вид на жительство"
+        ],
+        "negative_keywords": [
+            "спорт", "культура", "экономика без миграции",
+            "внутриполитическая новость без визового эффекта"
+        ],
+        "requires_event_language": True,
+    },
+]
+
+GLOBAL_NEWS_POSITIVE_KEYWORDS = [
+    "виза", "визовый", "внж", "пмж", "гражданство", "второе гражданство",
+    "residence permit", "permanent residency", "citizenship", "digital nomad",
+    "golden visa", "натурализация", "репатриация", "воссоединение семьи",
+    "убежище", "санкции", "консульство", "уведомление", "легализация"
+]
+
+GLOBAL_NEWS_NEGATIVE_KEYWORDS = [
+    "криминал", "происшествие", "катастрофа", "спорт", "вакансии",
+    "рынок недвижимости без изменения правил", "туризм без миграционного эффекта",
+    "реклама услуг", "кейсы клиентов", "отзывы", "маркетинговый материал"
+]
+
+
 TEXTS = {
     "ru": {
         "welcome": "Добро пожаловать в GRS Bot! 🌍\nПожалуйста, выберите язык:",
@@ -50,23 +218,6 @@ TEXTS = {
         "btn_news": "📰 Актуальные новости",
         "btn_contact": "📝 Написать менеджеру",
         "btn_limit": "📊 Проверить лимит",
-        "news_prompt": (
-            "Подготовь сводку новостей (6–10 пунктов) ТОЛЬКО по миграционному праву и политике, "
-            "актуальных для релокантов из России (граждане РФ, проживающие за рубежом или планирующие "
-            "переезд). Темы: визы, ВНЖ/ПМЖ, гражданство, убежище, трудовая/предпринимательская миграция, "
-            "учеба, цифровые кочевники, репатриация, воссоединение семьи. "
-            "Фокус: страны, популярные у релокантов из России, и правила, влияющие на выезд/проживание. "
-            "Исключай новости о внутреннем контроле миграции в РФ, если они не влияют на релокантов. "
-            "Период: весь 2025 год. Используй web_search. "
-            "Для каждого пункта укажи дату и источник в формате: "
-            "\"Источник: Название статьи, домен\" (без прямых ссылок). "
-            "Исключай нерелевантные новости (экономика, спорт, криминал и т.п.). "
-            "Не используй Wikipedia или вики-источники. "
-            "Формат: нумерованный список в стиле "
-            "\"1) 🧭 Заголовок — дата. Короткое описание. Источник: Название статьи, домен\". "
-            "Формат ответа: простой текст без Markdown; можно добавить тематические эмодзи. "
-            "Если в 2025 году по теме меньше 6 значимых новостей, дай меньше и укажи это."
-        ),
         "contact_info": "Связаться с менеджером GRS: @globalrelocationsolutions_cz\nБоты и автоматизация: @kovachinfo",
         "limit_info": "Использовано запросов: {count} из {max}.",
         "limit_reached": "🚫 Вы исчерпали лимит бесплатных запросов ({max}).\nПожалуйста, свяжитесь с менеджером для консультации: @manager_username",
@@ -83,22 +234,6 @@ TEXTS = {
         "btn_news": "📰 Latest News",
         "btn_contact": "📝 Contact Manager",
         "btn_limit": "📊 Check Limit",
-        "news_prompt": (
-            "Prepare a summary (6–10 items) ONLY about migration law and policy relevant to Russian relocators "
-            "(Russian citizens living abroad or planning to move). Topics: visas, residence permits, "
-            "citizenship, asylum, labor/business migration, study, digital nomads, repatriation, family reunion. "
-            "Focus on countries popular with relocators from Russia and rules affecting exit/residency. "
-            "Exclude internal RF migration-control news unless it affects relocators. "
-            "Time period: the whole of 2025. Use web_search. "
-            "For each item include date and source in format: "
-            "\"Source: Article title, domain\" (no direct links). "
-            "Exclude unrelated news (economy, sports, crime, etc.). "
-            "Do not use Wikipedia or wiki sources. "
-            "Format: numbered list like "
-            "\"1) 🧭 Title — date. Short description. Source: Article title, domain\". "
-            "Answer in plain text, no Markdown; you may add thematic emojis. "
-            "If fewer than 6 relevant 2025 items exist, provide fewer and state that."
-        ),
         "contact_info": "Contact GRS manager: @globalrelocationsolutions_cz\nBots & automation: @kovachinfo",
         "limit_info": "Requests used: {count} of {max}.",
         "limit_reached": "🚫 You have reached the free request limit ({max}).\nPlease contact the manager: @manager_username",
@@ -110,6 +245,196 @@ TEXTS = {
         "btn_en": "🇬🇧 English"
     }
 }
+
+
+def parse_config_list(raw_value):
+    return [item.strip() for item in re.split(r"[\n,;]+", raw_value or "") if item.strip()]
+
+
+def normalize_domain(value):
+    if not value:
+        return []
+
+    candidate = value.strip().lower()
+    if "://" not in candidate:
+        candidate = f"https://{candidate}"
+
+    parsed = urlparse(candidate)
+    host = (parsed.netloc or parsed.path).strip().lower()
+    host = host.split("/")[0].split(":")[0]
+    if not host:
+        return []
+
+    domains = [host]
+    if host.startswith("www."):
+        domains.append(host[4:])
+    return domains
+
+
+def get_news_source_profiles():
+    profiles = list(DEFAULT_NEWS_SOURCE_PROFILES)
+    allowed_domains = get_allowed_news_domains_from_env()
+
+    for domain in allowed_domains:
+        if any(profile["domain"] == domain for profile in profiles):
+            continue
+        profiles.append(
+            {
+                "domain": domain,
+                "label": domain,
+                "allowed_paths": ["/"],
+                "section_hints": [],
+                "positive_keywords": [],
+                "negative_keywords": [],
+            }
+        )
+    return profiles
+
+
+def get_allowed_news_domains_from_env():
+    domains = []
+
+    for item in parse_config_list(NEWS_ALLOWED_DOMAINS_RAW):
+        domains.extend(normalize_domain(item))
+
+    for item in parse_config_list(NEWS_SOURCE_URLS_RAW):
+        domains.extend(normalize_domain(item))
+
+    unique = []
+    seen = set()
+    for domain in domains:
+        if domain not in seen:
+            seen.add(domain)
+            unique.append(domain)
+    return unique
+
+
+def get_allowed_news_domains():
+    domains = [profile["domain"] for profile in get_news_source_profiles()]
+    unique = []
+    seen = set()
+    for domain in domains:
+        if domain not in seen:
+            seen.add(domain)
+            unique.append(domain)
+    return unique
+
+
+def build_source_profile_prompt(lang):
+    profiles = get_news_source_profiles()
+    lines = []
+
+    for profile in profiles:
+        path_hint = ", ".join(profile.get("allowed_paths", [])) or "/"
+        section_hint = ", ".join(profile.get("section_hints", [])) or "-"
+        positive_keywords = ", ".join(profile.get("positive_keywords", [])[:8]) or "-"
+        negative_keywords = ", ".join(profile.get("negative_keywords", [])[:6]) or "-"
+
+        if lang == "ru":
+            rule_parts = [
+                f"- {profile['label']} ({profile['domain']}):",
+                f"  допустимые URL/path: {path_hint};",
+                f"  разделы/рубрики: {section_hint};",
+                f"  позитивные ключевые слова: {positive_keywords};",
+                f"  исключать: {negative_keywords}."
+            ]
+            if profile.get("requires_event_language"):
+                rule_parts.append("  Используй только статьи о конкретном изменении правил, закона или процедуры.")
+            if profile.get("requires_russian_relocator_angle"):
+                rule_parts.append("  Бери материал только если он явно касается россиян за рубежом или планирующих переезд.")
+        else:
+            rule_parts = [
+                f"- {profile['label']} ({profile['domain']}):",
+                f"  allowed URL/path: {path_hint};",
+                f"  sections/topics: {section_hint};",
+                f"  positive keywords: {positive_keywords};",
+                f"  exclude: {negative_keywords}."
+            ]
+            if profile.get("requires_event_language"):
+                rule_parts.append("  Use only articles about a concrete rule, law, or procedure change.")
+            if profile.get("requires_russian_relocator_angle"):
+                rule_parts.append("  Keep only items clearly relevant to Russians abroad or planning relocation.")
+
+        lines.append(" ".join(rule_parts))
+
+    return "\n".join(lines)
+
+
+def build_news_prompt(lang):
+    today = datetime.now(timezone.utc).date()
+    start_date = today - timedelta(days=NEWS_LOOKBACK_DAYS)
+    allowed_domains = get_allowed_news_domains()
+    source_profiles = build_source_profile_prompt(lang)
+    positive_keywords = ", ".join(GLOBAL_NEWS_POSITIVE_KEYWORDS)
+    negative_keywords = ", ".join(GLOBAL_NEWS_NEGATIVE_KEYWORDS)
+
+    if lang == "ru":
+        domain_rule = (
+            "Используй только материалы с этих доменов: "
+            f"{', '.join(allowed_domains)}. Если релевантных материалов на них мало, "
+            "не выдумывай и прямо напиши, что выборка ограничена указанными источниками."
+            if allowed_domains else
+            "Используй несколько независимых новостных или официальных источников, а не один сайт."
+        )
+        return (
+            "Подготовь сводку из 6-10 пунктов только по миграционному праву, миграционной политике и "
+            "процедурам легализации, которые важны для релокантов из России. "
+            f"Период публикации: с {start_date.isoformat()} по {today.isoformat()}. "
+            "Включай только новости об изменениях виз, ВНЖ/ПМЖ, гражданства, убежища, трудовой или "
+            "предпринимательской миграции, учебы, digital nomad программ, воссоединения семьи, "
+            "репатриации, консульских и санкционных ограничений, если они влияют на выезд, въезд, "
+            "легализацию или проживание граждан РФ за рубежом. "
+            "Исключай криминал, происшествия, экономику, спорт, вакансии, общую внутреннюю политику без "
+            "миграционного эффекта, а также новости, не связанные с релокантами из РФ. "
+            f"{domain_rule} "
+            "Сначала отфильтруй кандидатов по источнику, URL/path, рубрике и ключевым словам. "
+            f"Общие позитивные ключевые слова: {positive_keywords}. "
+            f"Общие негативные ключевые слова: {negative_keywords}. "
+            "Статические гайды, SEO-обзоры, маркетинговые статьи, рейтинги и evergreen-материалы не включай, "
+            "если в них нет конкретного свежего изменения закона, процедуры или официального режима. "
+            "Профили источников и допустимые разделы:\n"
+            f"{source_profiles}\n"
+            "Для каждого пункта укажи: дату, страну, краткое объяснение, почему это важно релокантам из РФ, "
+            "и источник в формате: Источник: Название статьи, домен. "
+            "Формат ответа: простой текст без Markdown, нумерованный список вида "
+            "\"1) Заголовок — дата. Короткое описание. Почему важно: ... Источник: Название статьи, домен\". "
+            "Если статья не проходит хотя бы по двум позитивным признакам или попадает под негативные признаки, не включай ее. "
+            "Не используй Wikipedia или любые вики-источники. Не давай прямые ссылки. "
+            "Если релевантных новостей меньше 6, верни меньше и явно сообщи, что значимых материалов мало."
+        )
+
+    domain_rule = (
+        "Use only these domains: "
+        f"{', '.join(allowed_domains)}. If they do not contain enough relevant items, say the sample is limited "
+        "instead of filling the list with unrelated news."
+        if allowed_domains else
+        "Use several independent news or official sources instead of relying on a single site."
+    )
+    return (
+        "Prepare a 6-10 item summary only about migration law, migration policy, and legal status changes "
+        "relevant to Russian relocators. "
+        f"Publication date range: {start_date.isoformat()} to {today.isoformat()}. "
+        "Include only changes to visas, residence permits, permanent residence, citizenship, asylum, work or "
+        "business migration, study routes, digital nomad programs, family reunion, repatriation, and consular "
+        "or sanctions-related restrictions if they affect travel, entry, legalization, or residence for Russian "
+        "citizens abroad. Exclude crime, accidents, economy, sports, vacancies, generic domestic politics, and "
+        "anything not materially relevant to Russian relocators. "
+        f"{domain_rule} "
+        "First filter candidates by source, URL/path, section, and keywords. "
+        f"Global positive keywords: {positive_keywords}. "
+        f"Global negative keywords: {negative_keywords}. "
+        "Exclude evergreen guides, SEO explainers, service-marketing pages, rankings, and static overviews unless "
+        "they clearly describe a fresh law, policy, or procedure change in the target date range. "
+        "Source profiles and allowed sections:\n"
+        f"{source_profiles}\n"
+        "For each item provide the date, country, a short explanation of why it matters to Russian relocators, "
+        "and a source in the format: Source: Article title, domain. "
+        "Answer in plain text without Markdown as a numbered list like "
+        "\"1) Title — date. Short description. Why it matters: ... Source: Article title, domain\". "
+        "If an article does not satisfy at least two positive signals or hits negative signals, exclude it. "
+        "Do not use Wikipedia or other wiki sources. Do not include direct links. "
+        "If fewer than 6 relevant items exist, return fewer and explicitly say the pool was limited."
+    )
 
 # ---------------------------------------------
 # Функции работы с пользователями (БД)
@@ -259,6 +584,55 @@ def needs_news_retry(text):
         return True
     return False
 
+
+def is_service_message(text, lang):
+    return text in {TEXTS[lang]["error"], TEXTS[lang]["rate_limited"]}
+
+
+def build_web_search_tool(news_mode=False):
+    tool = {"type": "web_search", "search_context_size": "medium"}
+    if news_mode:
+        allowed_domains = get_allowed_news_domains()
+        if allowed_domains:
+            tool["filters"] = {"allowed_domains": allowed_domains}
+    return tool
+
+
+def get_response_models(news_mode=False):
+    if not news_mode:
+        return [OPENAI_MODEL]
+
+    candidates = []
+    for model in [OPENAI_NEWS_MODEL, OPENAI_MODEL, "gpt-5", "o4-mini"]:
+        if model and model not in candidates:
+            candidates.append(model)
+    return candidates
+
+
+def create_response(messages, lang="ru", news_mode=False):
+    last_error = None
+    web_search_tool = build_web_search_tool(news_mode=news_mode)
+
+    for model in get_response_models(news_mode=news_mode):
+        try:
+            request_payload = {
+                "model": model,
+                "input": messages,
+                "tools": [web_search_tool]
+            }
+            response = client.responses.create(**request_payload)
+            return response, model
+        except Exception as exc:
+            last_error = exc
+            logger.error(
+                "OpenAI request failed for model=%s news_mode=%s: %s",
+                model,
+                news_mode,
+                exc
+            )
+
+    raise last_error
+
 def escape_html(text):
     if text is None:
         return ""
@@ -388,11 +762,7 @@ def generate_answer(chat_id, user_message, lang="ru", use_history=True, news_mod
     messages.append({"role": "user", "content": user_message})
 
     try:
-        response = client.responses.create(
-            model=OPENAI_MODEL,
-            input=messages,
-            tools=[{"type": "web_search", "search_context_size": "medium"}]
-        )
+        response, model_used = create_response(messages, lang=lang, news_mode=news_mode)
         content = (response.output_text or "").strip()
         content_l = content.lower()
 
@@ -408,27 +778,22 @@ def generate_answer(chat_id, user_message, lang="ru", use_history=True, news_mod
                 else "Please use web_search and do not mention access limitations."
             )
             retry_messages = messages + [{"role": "user", "content": retry_rule}]
-            retry = client.responses.create(
-                model=OPENAI_MODEL,
-                input=retry_messages,
-                tools=[{"type": "web_search", "search_context_size": "medium"}]
-            )
+            retry, _ = create_response(retry_messages, lang=lang, news_mode=news_mode)
             return (retry.output_text or "").strip()
 
         if news_mode and needs_news_retry(content):
             retry_rule = (
-                "Не используй Wikipedia/вики-источники и дай только новости для релокантов из РФ."
+                "Не используй Wikipedia/вики-источники. Дай только релевантные миграционные новости "
+                "для релокантов из РФ и не включай нерелевантный общий новостной шум."
                 if lang == "ru"
-                else "Do not use Wikipedia/wiki sources and only provide news for Russian relocators."
+                else "Do not use Wikipedia/wiki sources. Only return migration news relevant to "
+                     "Russian relocators and exclude generic news noise."
             )
             retry_messages = messages + [{"role": "user", "content": retry_rule}]
-            retry = client.responses.create(
-                model=OPENAI_MODEL,
-                input=retry_messages,
-                tools=[{"type": "web_search", "search_context_size": "medium"}]
-            )
+            retry, _ = create_response(retry_messages, lang=lang, news_mode=news_mode)
             content = (retry.output_text or "").strip()
 
+        logger.info("OpenAI response completed with model=%s news_mode=%s", model_used, news_mode)
         return sanitize_plain_text(content) if news_mode else content
 
     except Exception as e:
@@ -593,11 +958,18 @@ def webhook():
             if cached:
                 ans = cached
             else:
-                # Если нажали русскую кнопку - отвечаем на русском, даже если в БД eng (опционально, но логично)
-                # Но пока оставим логику по настройке в БД, чтобы не путать
-                raw_ans = generate_answer(chat_id, t["news_prompt"], lang, use_history=False, news_mode=True)
-                ans = format_news_html(raw_ans, lang)
-                save_cached_news(lang, ans)
+                raw_ans = generate_answer(
+                    chat_id,
+                    build_news_prompt(lang),
+                    lang,
+                    use_history=False,
+                    news_mode=True
+                )
+                if is_service_message(raw_ans, lang):
+                    ans = raw_ans
+                else:
+                    ans = format_news_html(raw_ans, lang)
+                    save_cached_news(lang, ans)
         finally:
             stop_event.set()
         
