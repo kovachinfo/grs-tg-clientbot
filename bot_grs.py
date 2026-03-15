@@ -58,6 +58,8 @@ TELEGRAM_MAX_MESSAGE_LEN = 4096
 REQUEST_TIMEOUT_SEC = 15
 PROCESSED_UPDATE_TTL_SEC = 10 * 60
 TARGET_NEWS_ITEMS = 10
+READY_NEWS_MIN_ITEMS = 8
+NEWS_ADMIN_CHAT_ID = int(os.getenv("NEWS_ADMIN_CHAT_ID", "1111827435"))
 
 processed_updates = {}
 processed_updates_lock = threading.Lock()
@@ -529,7 +531,7 @@ def build_news_snapshot_prompt(lang):
             "Верни ТОЛЬКО JSON-массив объектов без markdown и без пояснений. "
             "Поля каждого объекта: country, title, date, summary, source_domain, source_url. "
             "summary: одно короткое описание в 1-2 предложениях. "
-            "date: как в статье или новости, строкой. "
+            "date: точная дата публикации или дата изменения, строкой; не используй относительные формулировки вроде '3 месяца назад'. "
             "source_url: полный URL оригинальной статьи. "
             "Короткий список допустимых источников и разделов:\n"
             + f"{source_profiles}"
@@ -552,7 +554,7 @@ def build_news_snapshot_prompt(lang):
         "Return ONLY a JSON array of objects, no markdown and no explanations. "
         "Fields for each object: country, title, date, summary, source_domain, source_url. "
         "summary: one short description in 1-2 sentences. "
-        "date: keep as a string from the article. "
+        "date: exact publication/change date as a string; do not use relative dates like '3 months ago'. "
         "source_url: full original article URL. "
         "Allowed source list and sections:\n"
         + f"{source_profiles}"
@@ -715,7 +717,7 @@ def get_latest_news_digest(lang):
         return None
 
 
-def save_news_digest(lang, items, rendered_html, raw_response, model_used):
+def save_news_digest(lang, items, rendered_html, raw_response, model_used, status="ready"):
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
@@ -728,9 +730,9 @@ def save_news_digest(lang, items, rendered_html, raw_response, model_used):
                         rendered_html,
                         raw_response,
                         model_used
-                    ) VALUES (%s, 'ready', %s, %s, %s, %s)
+                    ) VALUES (%s, %s, %s, %s, %s, %s)
                     """,
-                    (lang, Json(items), rendered_html, raw_response, model_used),
+                    (lang, status, Json(items), rendered_html, raw_response, model_used),
                 )
                 conn.commit()
     except Exception as e:
@@ -748,6 +750,16 @@ def clear_news_digest(lang=None):
                 conn.commit()
     except Exception as e:
         logger.error(f"Error clearing news digest: {e}")
+
+
+def is_admin_news_chat(chat_id):
+    return chat_id == NEWS_ADMIN_CHAT_ID
+
+
+def pending_news_message(lang):
+    if lang == "ru":
+        return "🛠 Дайджест ещё формируется. Пока не публикую сырую версию, попробуйте снова через несколько минут."
+    return "🛠 The digest is still being prepared. I am not publishing the raw version yet, please try again in a few minutes."
 
 # ---------------------------------------------
 # Очистка простого текста (без Markdown)
@@ -1301,11 +1313,19 @@ def normalize_digest_item(item):
     if not title or not summary:
         return None
 
+    relative_date_pattern = (
+        r"(?:≈|~|about|around|примерно)?\s*\d+\s*"
+        r"(?:дн|дня|дней|недел|недели|недель|месяц|месяца|месяцев|год|года|лет|"
+        r"day|days|week|weeks|month|months|year|years)\s*(?:назад|ago)?"
+    )
+    date = re.sub(relative_date_pattern, "", date, flags=re.I).strip(" \t-—,;.")
+
     if not country:
         country = extract_news_item_country(f"{title}") or ""
     if not country:
         country = "Страна" if re.search(r"[А-Яа-яЁё]", title) else "Country"
 
+    title = re.sub(relative_date_pattern, "", title, flags=re.I).strip(" \t-—,;.")
     summary = sanitize_plain_text(summary, preserve_urls=True)
     summary = re.sub(r"\s{2,}", " ", summary).strip(" \n\t-—,;.")
     sentences = re.split(r"(?<=[.!?])\s+", summary)
@@ -1382,6 +1402,24 @@ def dedupe_digest_items(items):
     return deduped[:TARGET_NEWS_ITEMS]
 
 
+def evaluate_digest_quality(items):
+    if not items:
+        return {"item_count": 0, "domains": 0, "urls": 0}
+
+    domains = {item.get("source_domain", "") for item in items if item.get("source_domain")}
+    urls = sum(1 for item in items if item.get("source_url"))
+    return {"item_count": len(items), "domains": len(domains), "urls": urls}
+
+
+def is_digest_ready(items):
+    quality = evaluate_digest_quality(items)
+    return (
+        quality["item_count"] >= READY_NEWS_MIN_ITEMS
+        and quality["domains"] >= 3
+        and quality["urls"] >= READY_NEWS_MIN_ITEMS
+    )
+
+
 def render_news_digest_html(items, lang):
     header = (
         "🧭 Новости для релокантов из России"
@@ -1391,14 +1429,11 @@ def render_news_digest_html(items, lang):
 
     formatted = []
     source_label = "Оригинал статьи" if lang == "ru" else "Original article"
-    link_label = "ссылка на оригинал" if lang == "ru" else "original link"
-
     for index, item in enumerate(items, start=1):
-        country = escape_html(item.get("country", "").strip())
         title = escape_html(item.get("title", "").strip())
         date = escape_html(item.get("date", "").strip())
         summary = escape_html(item.get("summary", "").strip())
-        lead = f"{index}) {country}: {title}"
+        lead = f"{index}) {title}"
         if date:
             lead += f" — {date}"
         if summary:
@@ -1408,12 +1443,9 @@ def render_news_digest_html(items, lang):
         url = item.get("source_url", "").strip()
 
         if url and domain:
-            source_line = (
-                f"{source_label}: {domain} - "
-                f"<a href=\"{escape_html_attr(url)}\">{link_label}</a>"
-            )
+            source_line = f"{source_label}: <a href=\"{escape_html_attr(url)}\">{domain}</a>"
         elif url:
-            source_line = f"{source_label}: <a href=\"{escape_html_attr(url)}\">{link_label}</a>"
+            source_line = f"{source_label}: <a href=\"{escape_html_attr(url)}\">{escape_html(url)}</a>"
         elif domain:
             source_line = f"{source_label}: {domain}"
         else:
@@ -1438,6 +1470,12 @@ def build_news_digest(chat_id, lang):
             build_news_snapshot_prompt(lang)
             + "\nСобери более широкую и интересную подборку: стремись к 10 пунктам, минимум к 8, "
               "и сначала ищи разные страны и разные домены. Не останавливайся на первых 2-3 совпадениях."
+        )
+        prompt_variants.append(
+            build_news_snapshot_prompt(lang)
+            + "\nПостарайся, если это возможно по фактическим материалам, включить публикации не только из espassport.pro, "
+              "но и из DW, Коммерсантъ, РБК, Право.ру, rus.err.ee, Confidence Group. "
+              "Не публикуй дайджест, если в нем меньше 8 качественных пунктов с полными ссылками на статьи."
         )
     else:
         prompt_variants.append(
@@ -1798,7 +1836,7 @@ def process_news_request(chat_id, lang, trigger_text):
                 ans = cached_digest["rendered_html"]
             else:
                 digest = build_news_digest(chat_id, lang)
-                if digest["items"]:
+                if digest["items"] and is_digest_ready(digest["items"]):
                     ans = digest["rendered_html"]
                     save_news_digest(
                         lang,
@@ -1806,8 +1844,28 @@ def process_news_request(chat_id, lang, trigger_text):
                         digest["rendered_html"],
                         digest["raw_response"],
                         digest["model_used"],
+                        status="ready",
                     )
                     save_cached_news(lang, ans)
+                elif digest["items"]:
+                    quality = evaluate_digest_quality(digest["items"])
+                    logger.warning(
+                        "News digest not ready yet chat_id=%s lang=%s items=%s domains=%s urls=%s",
+                        chat_id,
+                        lang,
+                        quality["item_count"],
+                        quality["domains"],
+                        quality["urls"],
+                    )
+                    save_news_digest(
+                        lang,
+                        digest["items"],
+                        digest["rendered_html"],
+                        digest["raw_response"],
+                        digest["model_used"],
+                        status="draft",
+                    )
+                    ans = pending_news_message(lang)
                 else:
                     logger.warning(
                         "News digest generation returned no items chat_id=%s lang=%s",
