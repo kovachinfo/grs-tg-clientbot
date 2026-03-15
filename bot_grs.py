@@ -34,7 +34,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = (os.getenv("OPENAI_MODEL") or "gpt-5-mini").strip()
-OPENAI_NEWS_MODEL = (os.getenv("OPENAI_NEWS_MODEL") or "gpt-5").strip()
+OPENAI_NEWS_MODEL = (os.getenv("OPENAI_NEWS_MODEL") or "gpt-4.1").strip()
 OPENAI_ENABLE_NEWS_FILTERS = os.getenv("OPENAI_ENABLE_NEWS_FILTERS", "false").lower() == "true"
 MANAGER_USERNAME = os.getenv("MANAGER_USERNAME", "globalrelocationsolutions_cz").lstrip("@")
 OPENAI_FALLBACK_MODELS_RAW = os.getenv("OPENAI_FALLBACK_MODELS") or "gpt-5,gpt-4.1,gpt-4o"
@@ -477,18 +477,19 @@ def build_news_prompt(lang, compact=False):
             + (
                 "Короткий список допустимых источников и разделов:\n"
                 if compact else
-                "Профили источников и допустимые разделы:\n"
+                "Короткий список допустимых источников и разделов:\n"
             )
             + f"{source_profiles}\n"
             "Для каждого пункта укажи: дату, страну, краткое объяснение, почему это важно релокантам из РФ, "
-            "и источник в формате: Источник: Название статьи, домен. "
+            "и источник в формате: Источник: Название статьи, домен, URL. "
             "Формат ответа: простой текст без Markdown, нумерованный список вида "
-            "\"1) Заголовок — дата. Короткое описание. Почему важно: ... Источник: Название статьи, домен\". "
+            "\"1) Заголовок — дата. Короткое описание. Почему важно: ... Источник: Название статьи, домен, https://...\". "
             "Пиши компактно: каждый пункт максимум 2 коротких предложения после заголовка, примерно на 20% короче обычной новости, "
             "без потери ключевого смысла. Не дублируй один и тот же сюжет, страну+событие или один и тот же источник по одной теме. "
             "Не добавляй вступление, преамбулу, общий абзац перед списком или заключение после списка. Выведи только нумерованный список. "
+            "Не останавливайся после первых 2-3 найденных публикаций: сначала попробуй собрать более широкую и интересную выборку по всем допустимым доменам. "
             "Если статья не проходит хотя бы по двум позитивным признакам или попадает под негативные признаки, не включай ее. "
-            "Не используй Wikipedia или любые вики-источники. Не давай прямые ссылки. "
+            "Не используй Wikipedia или любые вики-источники. "
             "Если релевантных новостей меньше 6, верни меньше и явно сообщи, что значимых материалов мало."
         )
 
@@ -518,18 +519,19 @@ def build_news_prompt(lang, compact=False):
         + (
             "Compact source list and allowed sections:\n"
             if compact else
-            "Source profiles and allowed sections:\n"
+            "Compact source list and allowed sections:\n"
         )
         + f"{source_profiles}\n"
         "For each item provide the date, country, a short explanation of why it matters to Russian relocators, "
-        "and a source in the format: Source: Article title, domain. "
+        "and a source in the format: Source: Article title, domain, URL. "
         "Answer in plain text without Markdown as a numbered list like "
-        "\"1) Title — date. Short description. Why it matters: ... Source: Article title, domain\". "
+        "\"1) Title — date. Short description. Why it matters: ... Source: Article title, domain, https://...\". "
         "Be concise: each item should be at most 2 short sentences after the title, about 20% shorter than a typical news brief, "
         "without losing the key meaning. Do not include duplicate events, duplicate country+event pairs, or the same story twice. "
         "Do not add any introduction, preamble, summary paragraph before the list, or closing paragraph after the list. Output only the numbered list. "
+        "Do not stop after the first 2-3 matches: try to build a broader and more interesting mix across the allowed domains first. "
         "If an article does not satisfy at least two positive signals or hits negative signals, exclude it. "
-        "Do not use Wikipedia or other wiki sources. Do not include direct links. "
+        "Do not use Wikipedia or other wiki sources. "
         "If fewer than 6 relevant items exist, return fewer and explicitly say the pool was limited."
     )
 
@@ -665,7 +667,7 @@ def clear_cached_news(lang=None):
 # ---------------------------------------------
 # Очистка простого текста (без Markdown)
 # ---------------------------------------------
-def sanitize_plain_text(text):
+def sanitize_plain_text(text, preserve_urls=False):
     if not text:
         return text
 
@@ -674,7 +676,8 @@ def sanitize_plain_text(text):
     text = re.sub(r"__([^_]+)__", r"\1", text)
     text = re.sub(r"`([^`]+)`", r"\1", text)
     text = re.sub(r"\[(.*?)\]\((.*?)\)", r"\1 — \2", text)
-    text = re.sub(r"https?://\S+", "", text)
+    if not preserve_urls:
+        text = re.sub(r"https?://\S+", "", text)
     text = re.sub(r"^\s*[-*]\s+", "- ", text, flags=re.M)
     text = re.sub(r"\b([a-z0-9.-]+\.[a-z]{2,})\.\s+\(\1\b", r"\1 (", text, flags=re.I)
     text = re.sub(r"[ \t]{2,}", " ", text)
@@ -727,6 +730,10 @@ def extract_news_item_domain(item_text):
     return fallback[-1].lower() if fallback else ""
 
 
+def get_news_item_domains(text):
+    return [extract_news_item_domain(item) for item in parse_news_items(text) if extract_news_item_domain(item)]
+
+
 def dedupe_news_items(items):
     deduped = []
     seen = set()
@@ -773,6 +780,16 @@ def needs_news_retry(text):
         return True
     lower = text.lower()
     if "wikipedia.org" in lower or "wikipedia" in lower or "wiki" in lower:
+        return True
+    return False
+
+
+def needs_news_diversity_retry(text):
+    items = parse_news_items(text)
+    domains = {domain for domain in get_news_item_domains(text) if domain}
+    if len(items) < 4:
+        return True
+    if len(domains) < 2 and len(items) >= 2:
         return True
     return False
 
@@ -1051,7 +1068,7 @@ def generate_answer(chat_id, user_message, lang="ru", use_history=True, news_mod
             content = (retry.output_text or "").strip()
 
         logger.info("OpenAI response completed with model=%s news_mode=%s", model_used, news_mode)
-        return sanitize_plain_text(content) if news_mode else content
+        return sanitize_plain_text(content, preserve_urls=news_mode) if news_mode else content
 
     except Exception as e:
         err_text = str(e)
@@ -1065,7 +1082,7 @@ def generate_answer(chat_id, user_message, lang="ru", use_history=True, news_mod
             try:
                 fb = client.responses.create(model=fallback_model, input=messages)
                 fb_text = (fb.output_text or "").strip()
-                return sanitize_plain_text(fb_text) if news_mode else fb_text
+                return sanitize_plain_text(fb_text, preserve_urls=news_mode) if news_mode else fb_text
             except Exception as fb_err:
                 last_fb_error = fb_err
                 logger.exception("Fallback error model=%s: %s", fallback_model, fb_err)
@@ -1139,13 +1156,27 @@ def process_news_request(chat_id, lang, trigger_text):
             if cached:
                 ans = cached
             else:
+                initial_prompt = build_news_prompt(lang, compact=True)
                 raw_ans = generate_answer(
                     chat_id,
-                    build_news_prompt(lang),
+                    initial_prompt,
                     lang,
                     use_history=False,
                     news_mode=True
                 )
+                if not is_service_message(raw_ans, lang) and needs_news_diversity_retry(raw_ans):
+                    diversity_prompt = (
+                        initial_prompt
+                        + "\nВерни более разнообразную подборку: минимум 4 пункта и минимум 3 разных домена, "
+                          "если это возможно по указанным источникам. Не ограничивайся только DW или одним сайтом."
+                    )
+                    raw_ans = generate_answer(
+                        chat_id,
+                        diversity_prompt,
+                        lang,
+                        use_history=False,
+                        news_mode=True
+                    )
                 if is_service_message(raw_ans, lang):
                     compact_prompt = build_news_prompt(lang, compact=True)
                     print(
