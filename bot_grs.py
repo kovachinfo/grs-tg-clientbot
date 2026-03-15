@@ -33,10 +33,11 @@ app = Flask(__name__)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
-OPENAI_NEWS_MODEL = os.getenv("OPENAI_NEWS_MODEL", "").strip()
+OPENAI_MODEL = (os.getenv("OPENAI_MODEL") or "gpt-5-mini").strip()
+OPENAI_NEWS_MODEL = (os.getenv("OPENAI_NEWS_MODEL") or "gpt-5-mini").strip()
 OPENAI_ENABLE_NEWS_FILTERS = os.getenv("OPENAI_ENABLE_NEWS_FILTERS", "false").lower() == "true"
 MANAGER_USERNAME = os.getenv("MANAGER_USERNAME", "globalrelocationsolutions_cz").lstrip("@")
+OPENAI_FALLBACK_MODELS_RAW = os.getenv("OPENAI_FALLBACK_MODELS") or "gpt-5,gpt-4.1,gpt-4o"
 
 try:
     OPENAI_TIMEOUT_SEC = float(os.getenv("OPENAI_TIMEOUT_SEC", "45"))
@@ -244,6 +245,7 @@ print(
     f"openai_sdk={get_package_version('openai')} "
     f"openai_model={OPENAI_MODEL} "
     f"openai_news_model={OPENAI_NEWS_MODEL or '<empty>'} "
+    f"openai_fallback_models={OPENAI_FALLBACK_MODELS_RAW} "
     f"news_lookback_days={NEWS_LOOKBACK_DAYS} "
     f"openai_timeout_sec={OPENAI_TIMEOUT_SEC} "
     f"news_filters_enabled={OPENAI_ENABLE_NEWS_FILTERS}",
@@ -289,6 +291,10 @@ TEXTS = {
 
 def parse_config_list(raw_value):
     return [item.strip() for item in re.split(r"[\n,;]+", raw_value or "") if item.strip()]
+
+
+def get_fallback_models():
+    return parse_config_list(OPENAI_FALLBACK_MODELS_RAW)
 
 
 def cleanup_processed_updates(now_ts=None):
@@ -775,11 +781,12 @@ def build_web_search_tool(news_mode=False, include_filters=True):
 
 
 def get_response_models(news_mode=False):
-    if not news_mode:
-        return [OPENAI_MODEL]
-
     candidates = []
-    for model in [OPENAI_NEWS_MODEL, OPENAI_MODEL]:
+    preferred = [OPENAI_MODEL]
+    if news_mode:
+        preferred = [OPENAI_NEWS_MODEL, OPENAI_MODEL]
+
+    for model in preferred + get_fallback_models():
         if model and model not in candidates:
             candidates.append(model)
     return candidates
@@ -1004,16 +1011,24 @@ def generate_answer(chat_id, user_message, lang="ru", use_history=True, news_mod
         logger.exception("Error OpenAI (Responses API): %s", err_text)
         print(f"Error OpenAI (Responses API): {err_text}", flush=True)
 
-        try:
-            fb = client.responses.create(model=OPENAI_MODEL, input=messages)
-            fb_text = (fb.output_text or "").strip()
-            return sanitize_plain_text(fb_text) if news_mode else fb_text
-        except Exception as fb_err:
-            logger.exception("Fallback error: %s", fb_err)
-            print(f"Fallback error: {fb_err}", flush=True)
-            if "rate_limit" in err_text or "token" in err_text.lower():
-                return TEXTS[lang]["rate_limited"]
+        last_fb_error = None
+        response_models = get_response_models(news_mode=news_mode)
+        fallback_candidates = response_models[1:] if len(response_models) > 1 else response_models
+        for fallback_model in fallback_candidates:
+            try:
+                fb = client.responses.create(model=fallback_model, input=messages)
+                fb_text = (fb.output_text or "").strip()
+                return sanitize_plain_text(fb_text) if news_mode else fb_text
+            except Exception as fb_err:
+                last_fb_error = fb_err
+                logger.exception("Fallback error model=%s: %s", fallback_model, fb_err)
+                print(f"Fallback error model={fallback_model}: {fb_err}", flush=True)
+
+        if "rate_limit" in err_text or "token" in err_text.lower():
+            return TEXTS[lang]["rate_limited"]
+        if last_fb_error:
             return TEXTS[lang]["error"]
+        return TEXTS[lang]["error"]
 
 # ---------------------------------------------
 # Отправка сообщений (с клавиатурой)
