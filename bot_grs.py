@@ -444,7 +444,7 @@ def build_news_prompt(lang, compact=False):
     today = datetime.now(timezone.utc).date()
     start_date = today - timedelta(days=NEWS_LOOKBACK_DAYS)
     allowed_domains = get_allowed_news_domains()
-    source_profiles = build_source_profile_prompt(lang, compact=compact)
+    source_profiles = build_source_profile_prompt(lang, compact=True)
     positive_keywords = ", ".join(GLOBAL_NEWS_POSITIVE_KEYWORDS)
     negative_keywords = ", ".join(GLOBAL_NEWS_NEGATIVE_KEYWORDS)
 
@@ -474,23 +474,22 @@ def build_news_prompt(lang, compact=False):
             f"Общие негативные ключевые слова: {negative_keywords}. "
             "Статические гайды, SEO-обзоры, маркетинговые статьи, рейтинги и evergreen-материалы не включай, "
             "если в них нет конкретного свежего изменения закона, процедуры или официального режима. "
-            + (
-                "Короткий список допустимых источников и разделов:\n"
-                if compact else
-                "Короткий список допустимых источников и разделов:\n"
-            )
+            + "Короткий список допустимых источников и разделов:\n"
             + f"{source_profiles}\n"
-            "Для каждого пункта укажи: дату, страну, краткое объяснение, почему это важно релокантам из РФ, "
-            "и источник в формате: Источник: Название статьи, домен, URL. "
+            "Для каждого пункта укажи: дату, страну, одно короткое и понятное описание сути изменения, "
+            "и источник в формате: Оригинал статьи: домен, URL. "
             "Формат ответа: простой текст без Markdown, нумерованный список вида "
-            "\"1) Заголовок — дата. Короткое описание. Почему важно: ... Источник: Название статьи, домен, https://...\". "
-            "Пиши компактно: каждый пункт максимум 2 коротких предложения после заголовка, примерно на 20% короче обычной новости, "
-            "без потери ключевого смысла. Не дублируй один и тот же сюжет, страну+событие или один и тот же источник по одной теме. "
-            "Не добавляй вступление, преамбулу, общий абзац перед списком или заключение после списка. Выведи только нумерованный список. "
+            "\"1) Страна: Заголовок — дата. Одно короткое описание. Оригинал статьи: домен, https://...\". "
+            "Предпочитай разнообразие по странам: сначала разные страны/юрисдикции, и только затем второй пункт по той же стране, "
+            "если это отдельное сильное изменение другого типа. "
+            "Пиши живо и читабельно, без канцелярита и сухих юридических формулировок. "
+            "Каждый пункт должен быть примерно в 2 раза короче обычной заметки: только суть изменения, без блока 'Почему важно', "
+            "без 'Кратко', без вступления, преамбулы, общего абзаца перед списком и без заключения после списка. "
+            "Не дублируй один и тот же сюжет, страну+событие или один и тот же источник по одной теме. Выведи только нумерованный список. "
             "Не останавливайся после первых 2-3 найденных публикаций: сначала попробуй собрать более широкую и интересную выборку по всем допустимым доменам. "
             "Если статья не проходит хотя бы по двум позитивным признакам или попадает под негативные признаки, не включай ее. "
             "Не используй Wikipedia или любые вики-источники. "
-            "Если релевантных новостей меньше 6, верни меньше и явно сообщи, что значимых материалов мало."
+            "Если релевантных новостей меньше 6, просто верни меньше пунктов без дополнительных объяснений."
         )
 
     domain_rule = (
@@ -516,23 +515,21 @@ def build_news_prompt(lang, compact=False):
         f"Global negative keywords: {negative_keywords}. "
         "Exclude evergreen guides, SEO explainers, service-marketing pages, rankings, and static overviews unless "
         "they clearly describe a fresh law, policy, or procedure change in the target date range. "
-        + (
-            "Compact source list and allowed sections:\n"
-            if compact else
-            "Compact source list and allowed sections:\n"
-        )
+        + "Compact source list and allowed sections:\n"
         + f"{source_profiles}\n"
-        "For each item provide the date, country, a short explanation of why it matters to Russian relocators, "
-        "and a source in the format: Source: Article title, domain, URL. "
+        "For each item provide the date, country, one short and readable summary of the change, "
+        "and a source in the format: Original article: domain, URL. "
         "Answer in plain text without Markdown as a numbered list like "
-        "\"1) Title — date. Short description. Why it matters: ... Source: Article title, domain, https://...\". "
-        "Be concise: each item should be at most 2 short sentences after the title, about 20% shorter than a typical news brief, "
-        "without losing the key meaning. Do not include duplicate events, duplicate country+event pairs, or the same story twice. "
-        "Do not add any introduction, preamble, summary paragraph before the list, or closing paragraph after the list. Output only the numbered list. "
+        "\"1) Country: Title — date. One short description. Original article: domain, https://...\". "
+        "Prefer country diversity: cover different countries/jurisdictions first, and only then include a second item "
+        "from the same country if it is a separate strong policy change of another type. "
+        "Write in a readable human style, not dry bureaucratic prose. Each item should be about half the length of a normal brief: "
+        "only the core change, no 'Why it matters' block, no 'Summary' label, no intro, and no closing note. "
+        "Do not include duplicate events, duplicate country+event pairs, or the same story twice. Output only the numbered list. "
         "Do not stop after the first 2-3 matches: try to build a broader and more interesting mix across the allowed domains first. "
         "If an article does not satisfy at least two positive signals or hits negative signals, exclude it. "
         "Do not use Wikipedia or other wiki sources. "
-        "If fewer than 6 relevant items exist, return fewer and explicitly say the pool was limited."
+        "If fewer than 6 relevant items exist, just return fewer items without additional explanation."
     )
 
 # ---------------------------------------------
@@ -689,7 +686,7 @@ def parse_news_items(text):
     if not text:
         return []
 
-    normalized = sanitize_plain_text(text)
+    normalized = sanitize_plain_text(text, preserve_urls=True)
     normalized = re.sub(r"(?<!\n)\s+(?=\d+[\).]\s+)", "\n", normalized)
     lines = [ln.strip() for ln in normalized.splitlines() if ln.strip()]
     items = []
@@ -730,6 +727,31 @@ def extract_news_item_domain(item_text):
     return fallback[-1].lower() if fallback else ""
 
 
+def extract_news_item_country(item_text):
+    text = re.sub(r"^\d+[\).]\s*", "", item_text.strip())
+
+    title_part = re.split(r"\s+Почему важно:|\s+Источник:|\s+Why it matters:|\s+Source:", text, maxsplit=1)[0]
+    if ":" in title_part:
+        country_candidate = title_part.split(":", 1)[0].strip()
+        country_candidate = re.sub(r"[^A-Za-zА-Яа-яЁё0-9/—\- ]+", "", country_candidate).strip()
+        if 2 <= len(country_candidate) <= 40:
+            return country_candidate.lower()
+
+    known_countries = [
+        "сша", "польша", "румыния", "финляндия", "грузия", "япония", "канада",
+        "черногория", "китай", "германия", "испания", "черногория", "швеция",
+        "норвегия", "латвия", "литва", "эстония", "чехия", "дания", "франция",
+        "исландия", "греция", "кипр", "сербия", "португалия", "италия",
+        "венгрия", "хорватия", "черногория", "нидерланды", "бельгия",
+        "евросоюз", "ес", "шенген", "румыния/шенген", "россия—китай"
+    ]
+    lower = title_part.lower()
+    for country in known_countries:
+        if lower.startswith(country):
+            return country
+    return ""
+
+
 def get_news_item_domains(text):
     return [extract_news_item_domain(item) for item in parse_news_items(text) if extract_news_item_domain(item)]
 
@@ -738,18 +760,46 @@ def dedupe_news_items(items):
     deduped = []
     seen = set()
     domain_counts = {}
+    country_counts = {}
 
     for item in items:
         key = normalize_news_item_key(item)
         if not key or key in seen:
             continue
         domain = extract_news_item_domain(item)
+        country = extract_news_item_country(item)
+        if country and country_counts.get(country, 0) >= 1 and len(deduped) < 6:
+            continue
         if domain and domain_counts.get(domain, 0) >= 2 and len(deduped) >= 4:
             continue
         seen.add(key)
         if domain:
             domain_counts[domain] = domain_counts.get(domain, 0) + 1
+        if country:
+            country_counts[country] = country_counts.get(country, 0) + 1
         deduped.append(item)
+
+    if len(deduped) < min(4, len(items)):
+        deduped = []
+        seen = set()
+        domain_counts = {}
+        country_counts = {}
+        for item in items:
+            key = normalize_news_item_key(item)
+            if not key or key in seen:
+                continue
+            domain = extract_news_item_domain(item)
+            country = extract_news_item_country(item)
+            if country and country_counts.get(country, 0) >= 2 and len(deduped) >= 4:
+                continue
+            if domain and domain_counts.get(domain, 0) >= 2 and len(deduped) >= 4:
+                continue
+            seen.add(key)
+            if domain:
+                domain_counts[domain] = domain_counts.get(domain, 0) + 1
+            if country:
+                country_counts[country] = country_counts.get(country, 0) + 1
+            deduped.append(item)
 
     return deduped[:8]
 
@@ -893,59 +943,98 @@ def escape_html(text):
         .replace(">", "&gt;")
     )
 
-def bold_title(item_text):
-    numbered_prefix = ""
-    body = item_text.strip()
+def escape_html_attr(text):
+    return escape_html(text).replace('"', "&quot;")
 
-    match = re.match(r"^(\d+[\).]\s+)(.+)$", body)
-    if match:
-        numbered_prefix = match.group(1)
-        body = match.group(2).strip()
 
-    split_match = re.match(
-        r"^(.*?)(\s+[—-]\s+\d{1,2}[./ ]\d{1,2}[./ ]\d{2,4}\.?.*)$",
-        body
+def extract_source_info(item_text):
+    source_match = re.search(
+        r"(?:оригинал статьи|источник|original article|source):\s*(.+)$",
+        item_text,
+        flags=re.I,
     )
-    if split_match:
-        title = split_match.group(1).strip()
-        rest = split_match.group(2).strip()
-        return f"{numbered_prefix}<b>{title}</b> {rest}".strip()
+    source_text = source_match.group(1).strip() if source_match else ""
+    url_match = re.search(r"https?://\S+", source_text or item_text, flags=re.I)
+    url = url_match.group(0).rstrip(").,;") if url_match else ""
+    domain = extract_news_item_domain(source_text or item_text)
 
-    for marker in [" Почему важно:", " Источник:"]:
-        if marker in body:
-            title, rest = body.split(marker, 1)
-            return f"{numbered_prefix}<b>{title.strip()}</b>{marker}{rest.strip()}".strip()
+    if not domain and url:
+        parsed = urlparse(url)
+        domain = parsed.netloc.lower().removeprefix("www.")
 
-    for delim in [" — ", " - "]:
-        if delim in body:
-            title, rest = body.split(delim, 1)
-            return f"{numbered_prefix}<b>{title.strip()}</b>{delim}{rest.strip()}".strip()
+    return {"url": url, "domain": domain}
 
-    return f"{numbered_prefix}<b>{body}</b>".strip()
+
+def clean_news_item_text(item_text):
+    text = sanitize_plain_text(item_text, preserve_urls=True)
+    text = re.sub(r"\s*(Кратко|Summary):\s*", " ", text, flags=re.I)
+    text = re.sub(
+        r"\s*(Почему важно|Why it matters):.*?(?=(Оригинал статьи|Источник|Original article|Source):|$)",
+        "",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(
+        r"\s*(Оригинал статьи|Источник|Original article|Source):.*$",
+        "",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(r"^\s*Ниже представлены все найденные подходящие публикации:\s*", "", text, flags=re.I)
+    text = re.sub(r"^\s*Выбранных источников.*?:\s*", "", text, flags=re.I)
+    text = re.sub(r"^\s*Количество релевантных материалов.*?:\s*", "", text, flags=re.I)
+    text = re.sub(r"\bУвы,.*$", "", text, flags=re.I)
+    text = re.sub(r"\bПримечание:.*$", "", text, flags=re.I)
+    text = re.sub(r"\s{2,}", " ", text)
+    text = text.strip(" \n\t-—,;.")
+
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    if len(sentences) > 2:
+        text = " ".join(sentences[:2]).strip()
+
+    return text
+
+
+def render_news_item_html(item_text, lang):
+    cleaned = clean_news_item_text(item_text)
+    source = extract_source_info(item_text)
+    body = escape_html(cleaned)
+    source_label = "Оригинал статьи" if lang == "ru" else "Original article"
+    link_label = "ссылка на оригинал" if lang == "ru" else "original link"
+
+    if source["url"] and source["domain"]:
+        source_html = (
+            f"{source_label}: {escape_html(source['domain'])} - "
+            f"<a href=\"{escape_html_attr(source['url'])}\">{link_label}</a>"
+        )
+    elif source["url"]:
+        source_html = f"{source_label}: <a href=\"{escape_html_attr(source['url'])}\">{link_label}</a>"
+    elif source["domain"]:
+        source_html = f"{source_label}: {escape_html(source['domain'])}"
+    else:
+        source_html = ""
+
+    return f"{body}\n{source_html}".strip() if source_html else body
 
 def format_news_html(text, lang):
     header = (
-        "🧭 <b>Новости для релокантов из России</b>"
+        "🧭 Новости для релокантов из России"
         if lang == "ru"
-        else "🧭 <b>News for Russian Relocators</b>"
-    )
-    footer = (
-        "Примечание: окончательные решения по визам и статусам принимают государственные органы соответствующих стран."
-        if lang == "ru"
-        else "Note: final decisions on visas and status matters are made by the relevant state authorities."
+        else "🧭 News for Russian Relocators"
     )
     if not text:
-        return f"{header}\n\n{escape_html(footer)}"
+        return escape_html(header)
 
     items = dedupe_news_items(parse_news_items(text))
 
     formatted = []
     for raw in items:
-        escaped = escape_html(raw)
-        formatted.append(bold_title(escaped))
+        rendered = render_news_item_html(raw, lang)
+        if rendered:
+            formatted.append(rendered)
 
     body = "\n\n".join(formatted) if formatted else escape_html(text)
-    return f"{header}\n\n{body}\n\n{escape_html(footer)}".strip()
+    return f"{escape_html(header)}\n\n{body}".strip()
 
 
 def split_message_chunks(text, limit=TELEGRAM_MAX_MESSAGE_LEN):
