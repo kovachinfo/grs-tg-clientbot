@@ -36,6 +36,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 OPENAI_NEWS_MODEL = os.getenv("OPENAI_NEWS_MODEL", "").strip()
 OPENAI_ENABLE_NEWS_FILTERS = os.getenv("OPENAI_ENABLE_NEWS_FILTERS", "false").lower() == "true"
+MANAGER_USERNAME = os.getenv("MANAGER_USERNAME", "globalrelocationsolutions_cz").lstrip("@")
 
 try:
     OPENAI_TIMEOUT_SEC = float(os.getenv("OPENAI_TIMEOUT_SEC", "45"))
@@ -231,6 +232,13 @@ def get_package_version(name):
         return "unknown"
 
 
+def format_limit_reached_message(lang):
+    return TEXTS[lang]["limit_reached"].format(
+        max=MAX_FREE_REQUESTS,
+        manager_username=f"@{MANAGER_USERNAME}"
+    )
+
+
 print(
     "Startup config "
     f"openai_sdk={get_package_version('openai')} "
@@ -252,7 +260,7 @@ TEXTS = {
         "btn_limit": "📊 Проверить лимит",
         "contact_info": "Связаться с менеджером GRS: @globalrelocationsolutions_cz\nБоты и автоматизация: @kovachinfo",
         "limit_info": "Использовано запросов: {count} из {max}.",
-        "limit_reached": "🚫 Вы исчерпали лимит бесплатных запросов ({max}).\nПожалуйста, свяжитесь с менеджером для консультации: @manager_username",
+        "limit_reached": "🚫 Вы исчерпали лимит бесплатных запросов ({max}).\nПожалуйста, свяжитесь с менеджером для консультации: {manager_username}",
         "lang_selected": "🇷🇺 Язык установлен: Русский",
         "searching": "🔍 Ищу информацию, это может занять минуту...",
         "error": "❌ Произошла ошибка сервиса.",
@@ -268,7 +276,7 @@ TEXTS = {
         "btn_limit": "📊 Check Limit",
         "contact_info": "Contact GRS manager: @globalrelocationsolutions_cz\nBots & automation: @kovachinfo",
         "limit_info": "Requests used: {count} of {max}.",
-        "limit_reached": "🚫 You have reached the free request limit ({max}).\nPlease contact the manager: @manager_username",
+        "limit_reached": "🚫 You have reached the free request limit ({max}).\nPlease contact the manager: {manager_username}",
         "lang_selected": "🇬🇧 Language set: English",
         "searching": "🔍 Searching...",
         "error": "❌ Service error.",
@@ -1206,7 +1214,7 @@ def webhook():
     if text in [ru_t["btn_news"], en_t["btn_news"]]:
         # Проверяем лимит перед новостями (это тоже запрос)
         if user['request_count'] >= MAX_FREE_REQUESTS and not user.get('is_premium'):
-            send_message(chat_id, t["limit_reached"])
+            send_message(chat_id, format_limit_reached_message(lang))
             return "ok"
 
         job_key = make_news_job_key(chat_id, lang)
@@ -1233,7 +1241,7 @@ def webhook():
     
     # Проверка лимита
     if user['request_count'] >= MAX_FREE_REQUESTS and not user.get('is_premium'):
-        send_message(chat_id, t["limit_reached"])
+        send_message(chat_id, format_limit_reached_message(lang))
         return "ok"
 
     increment_request_count(chat_id)
