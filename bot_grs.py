@@ -4,6 +4,7 @@ import requests
 import time
 import threading
 import re
+import json
 from datetime import datetime, timedelta, timezone
 from importlib.metadata import PackageNotFoundError, version
 from urllib.parse import urlparse
@@ -11,6 +12,7 @@ from urllib.parse import urlparse
 from dotenv import load_dotenv
 from flask import Flask, request
 from openai import OpenAI
+from psycopg2.extras import Json
 
 from database import DatabasePool, get_db_connection
 
@@ -502,6 +504,60 @@ def build_news_prompt(lang, compact=False):
         "If fewer than 10 relevant items exist, return fewer, but first try to collect 10."
     )
 
+
+def build_news_snapshot_prompt(lang):
+    today = datetime.now(timezone.utc).date()
+    start_date = today - timedelta(days=NEWS_LOOKBACK_DAYS)
+    allowed_domains = get_allowed_news_domains()
+    source_profiles = build_source_profile_prompt(lang, compact=True)
+
+    if lang == "ru":
+        domain_rule = (
+            "Работай только с этим пулом доменов: " + ", ".join(allowed_domains) + ". "
+            if allowed_domains else
+            "Используй несколько независимых источников. "
+        )
+        return (
+            f"Найди до {TARGET_NEWS_ITEMS} самых полезных новостей для релокантов из России за период "
+            f"с {start_date.isoformat()} по {today.isoformat()}. "
+            "Темы: визы, ВНЖ/ПМЖ, гражданство, правила въезда, трудовая и учебная миграция, digital nomad, "
+            "воссоединение семьи, легализация, консульские ограничения. "
+            "Приоритет: разные страны и разные домены; не больше 2 новостей из одной страны, если есть альтернатива. "
+            "Не включай общие гайды, обзоры услуг, внутренние новости РФ без прямого влияния на релокацию, спорт, криминал, вакансии. "
+            + domain_rule
+            + "Если точной статьи нет, не придумывай ее. Нужна только оригинальная статья, а не главная страница сайта. "
+            "Верни ТОЛЬКО JSON-массив объектов без markdown и без пояснений. "
+            "Поля каждого объекта: country, title, date, summary, source_domain, source_url. "
+            "summary: одно короткое описание в 1-2 предложениях. "
+            "date: как в статье или новости, строкой. "
+            "source_url: полный URL оригинальной статьи. "
+            "Короткий список допустимых источников и разделов:\n"
+            + f"{source_profiles}"
+        )
+
+    domain_rule = (
+        "Use only this source pool: " + ", ".join(allowed_domains) + ". "
+        if allowed_domains else
+        "Use several independent sources. "
+    )
+    return (
+        f"Find up to {TARGET_NEWS_ITEMS} most useful news items for Russian relocators from "
+        f"{start_date.isoformat()} to {today.isoformat()}. "
+        "Topics: visas, residence permits, citizenship, entry rules, work and study migration, digital nomads, "
+        "family reunion, legalization, consular restrictions. Prioritize different countries and different domains; "
+        "avoid more than 2 items from one country if alternatives exist. "
+        "Exclude generic guides, service pages, Russia-only domestic news without relocation impact, sports, crime, vacancies. "
+        + domain_rule
+        + "If there is no exact article, do not invent it. Only original article URLs, not site homepages. "
+        "Return ONLY a JSON array of objects, no markdown and no explanations. "
+        "Fields for each object: country, title, date, summary, source_domain, source_url. "
+        "summary: one short description in 1-2 sentences. "
+        "date: keep as a string from the article. "
+        "source_url: full original article URL. "
+        "Allowed source list and sections:\n"
+        + f"{source_profiles}"
+    )
+
 # ---------------------------------------------
 # Функции работы с пользователями (БД)
 # ---------------------------------------------
@@ -630,6 +686,68 @@ def clear_cached_news(lang=None):
                 conn.commit()
     except Exception as e:
         logger.error(f"Error clearing cached news: {e}")
+
+
+def get_latest_news_digest(lang):
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT rendered_html, items_json, raw_response, model_used, created_at
+                    FROM news_digests
+                    WHERE language_code = %s AND status = 'ready'
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (lang,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return None
+
+                age_sec = time.time() - row["created_at"].timestamp()
+                if age_sec > NEWS_CACHE_TTL_SEC:
+                    return None
+                return row
+    except Exception as e:
+        logger.error(f"Error getting latest news digest: {e}")
+        return None
+
+
+def save_news_digest(lang, items, rendered_html, raw_response, model_used):
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO news_digests (
+                        language_code,
+                        status,
+                        items_json,
+                        rendered_html,
+                        raw_response,
+                        model_used
+                    ) VALUES (%s, 'ready', %s, %s, %s, %s)
+                    """,
+                    (lang, Json(items), rendered_html, raw_response, model_used),
+                )
+                conn.commit()
+    except Exception as e:
+        logger.error(f"Error saving news digest: {e}")
+
+
+def clear_news_digest(lang=None):
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                if lang:
+                    cur.execute("DELETE FROM news_digests WHERE language_code = %s", (lang,))
+                else:
+                    cur.execute("DELETE FROM news_digests")
+                conn.commit()
+    except Exception as e:
+        logger.error(f"Error clearing news digest: {e}")
 
 # ---------------------------------------------
 # Очистка простого текста (без Markdown)
@@ -1143,6 +1261,219 @@ def extract_response_text(response, news_mode=False):
     return text
 
 
+def extract_json_array_from_text(text):
+    if not text:
+        return []
+
+    candidate = text.strip()
+    fenced = re.search(r"```(?:json)?\s*(\[.*\])\s*```", candidate, flags=re.S | re.I)
+    if fenced:
+        candidate = fenced.group(1).strip()
+    else:
+        start = candidate.find("[")
+        end = candidate.rfind("]")
+        if start != -1 and end != -1 and end > start:
+            candidate = candidate[start:end + 1]
+
+    try:
+        data = json.loads(candidate)
+        return data if isinstance(data, list) else []
+    except json.JSONDecodeError:
+        return []
+
+
+def normalize_digest_item(item):
+    if not isinstance(item, dict):
+        return None
+
+    country = str(item.get("country", "")).strip()
+    title = str(item.get("title", "")).strip()
+    date = str(item.get("date", "")).strip()
+    summary = str(item.get("summary", "")).strip()
+    source_domain = normalize_host(str(item.get("source_domain", "")).strip())
+    source_url = str(item.get("source_url", "")).strip()
+
+    if source_url and not source_url.startswith(("http://", "https://")):
+        source_url = ""
+    if source_url and not source_domain:
+        source_domain = normalize_host(source_url)
+
+    if not title or not summary:
+        return None
+
+    if not country:
+        country = extract_news_item_country(f"{title}") or ""
+    if not country:
+        country = "Страна" if re.search(r"[А-Яа-яЁё]", title) else "Country"
+
+    summary = sanitize_plain_text(summary, preserve_urls=True)
+    summary = re.sub(r"\s{2,}", " ", summary).strip(" \n\t-—,;.")
+    sentences = re.split(r"(?<=[.!?])\s+", summary)
+    if len(sentences) > 2:
+        summary = " ".join(sentences[:2]).strip()
+
+    return {
+        "country": country,
+        "title": title,
+        "date": date,
+        "summary": summary,
+        "source_domain": source_domain,
+        "source_url": source_url,
+    }
+
+
+def enrich_digest_items_with_citations(items, response):
+    citations = collect_response_citations(response)
+    if not citations:
+        return items
+
+    used_urls = {item["source_url"] for item in items if item.get("source_url")}
+    enriched = []
+    for item in items:
+        current = dict(item)
+        if current.get("source_url"):
+            enriched.append(current)
+            continue
+
+        item_domain = comparable_domain(current.get("source_domain"))
+        matched = None
+        for citation in citations:
+            if citation["url"] in used_urls:
+                continue
+            if item_domain and comparable_domain(citation["domain"]) == item_domain:
+                matched = citation
+                break
+
+        if matched:
+            current["source_url"] = matched["url"]
+            current["source_domain"] = current.get("source_domain") or matched["domain"]
+            used_urls.add(matched["url"])
+        enriched.append(current)
+    return enriched
+
+
+def dedupe_digest_items(items):
+    deduped = []
+    seen = set()
+    country_counts = {}
+    domain_counts = {}
+
+    for item in items:
+        key = normalize_news_item_key(
+            f"{item.get('country', '')}: {item.get('title', '')} {item.get('summary', '')}"
+        )
+        if not key or key in seen:
+            continue
+
+        country = item.get("country", "").strip().lower()
+        domain = item.get("source_domain", "").strip().lower()
+        if country and country_counts.get(country, 0) >= 2 and len(deduped) >= 6:
+            continue
+        if domain and domain_counts.get(domain, 0) >= 3 and len(deduped) >= 6:
+            continue
+
+        seen.add(key)
+        if country:
+            country_counts[country] = country_counts.get(country, 0) + 1
+        if domain:
+            domain_counts[domain] = domain_counts.get(domain, 0) + 1
+        deduped.append(item)
+
+    return deduped[:TARGET_NEWS_ITEMS]
+
+
+def render_news_digest_html(items, lang):
+    header = (
+        "🧭 Новости для релокантов из России"
+        if lang == "ru"
+        else "🧭 News for Russian Relocators"
+    )
+
+    formatted = []
+    source_label = "Оригинал статьи" if lang == "ru" else "Original article"
+    link_label = "ссылка на оригинал" if lang == "ru" else "original link"
+
+    for index, item in enumerate(items, start=1):
+        country = escape_html(item.get("country", "").strip())
+        title = escape_html(item.get("title", "").strip())
+        date = escape_html(item.get("date", "").strip())
+        summary = escape_html(item.get("summary", "").strip())
+        lead = f"{index}) {country}: {title}"
+        if date:
+            lead += f" — {date}"
+        if summary:
+            lead += f". {summary}"
+
+        domain = escape_html(item.get("source_domain", "").strip())
+        url = item.get("source_url", "").strip()
+
+        if url and domain:
+            source_line = (
+                f"{source_label}: {domain} - "
+                f"<a href=\"{escape_html_attr(url)}\">{link_label}</a>"
+            )
+        elif url:
+            source_line = f"{source_label}: <a href=\"{escape_html_attr(url)}\">{link_label}</a>"
+        elif domain:
+            source_line = f"{source_label}: {domain}"
+        else:
+            source_line = ""
+
+        formatted.append(f"{lead}\n{source_line}".strip())
+
+    return f"{escape_html(header)}\n\n" + "\n\n".join(formatted)
+
+
+def build_news_digest(chat_id, lang):
+    system_content = (
+        "Ты собираешь ежедневный миграционный дайджест. "
+        "Отвечай только валидным JSON-массивом без markdown и без пояснений."
+        if lang == "ru" else
+        "You build a daily migration digest. Respond only with a valid JSON array, no markdown, no commentary."
+    )
+
+    prompt_variants = [build_news_snapshot_prompt(lang)]
+    if lang == "ru":
+        prompt_variants.append(
+            build_news_snapshot_prompt(lang)
+            + "\nСобери более широкую и интересную подборку: стремись к 10 пунктам, минимум к 8, "
+              "и сначала ищи разные страны и разные домены. Не останавливайся на первых 2-3 совпадениях."
+        )
+    else:
+        prompt_variants.append(
+            build_news_snapshot_prompt(lang)
+            + "\nBuild a broader and more interesting selection: aim for 10 items, minimum 8, "
+              "and prioritize different countries and domains before repeating one source."
+        )
+
+    best_result = {"items": [], "rendered_html": "", "raw_response": "", "model_used": ""}
+
+    for prompt in prompt_variants:
+        messages = [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": prompt},
+        ]
+        response, model_used = create_response(messages, lang=lang, news_mode=True)
+        raw_text = (response.output_text or "").strip()
+        items = [normalize_digest_item(item) for item in extract_json_array_from_text(raw_text)]
+        items = [item for item in items if item]
+        items = enrich_digest_items_with_citations(items, response)
+        items = dedupe_digest_items(items)
+
+        candidate = {
+            "items": items,
+            "rendered_html": render_news_digest_html(items, lang) if items else "",
+            "raw_response": raw_text,
+            "model_used": model_used,
+        }
+        if len(candidate["items"]) > len(best_result["items"]):
+            best_result = candidate
+        if len(candidate["items"]) >= 8:
+            return candidate
+
+    return best_result
+
+
 def escape_html(text):
     if text is None:
         return ""
@@ -1462,66 +1793,28 @@ def process_news_request(chat_id, lang, trigger_text):
 
     try:
         try:
-            cached = get_cached_news(lang)
-            if cached:
-                ans = cached
+            cached_digest = get_latest_news_digest(lang)
+            if cached_digest and cached_digest.get("rendered_html"):
+                ans = cached_digest["rendered_html"]
             else:
-                initial_prompt = build_news_prompt(lang, compact=True)
-                raw_ans = generate_answer(
-                    chat_id,
-                    initial_prompt,
-                    lang,
-                    use_history=False,
-                    news_mode=True
-                )
-                if not is_service_message(raw_ans, lang) and needs_news_diversity_retry(raw_ans):
-                    diversity_prompt = (
-                        initial_prompt
-                        + "\nСобери более полную подборку: стремись к 10 пунктам, минимум к 8, и используй разные страны и домены, "
-                          "если это возможно. Не ограничивайся одним сайтом."
-                    )
-                    raw_ans = generate_answer(
-                        chat_id,
-                        diversity_prompt,
+                digest = build_news_digest(chat_id, lang)
+                if digest["items"]:
+                    ans = digest["rendered_html"]
+                    save_news_digest(
                         lang,
-                        use_history=False,
-                        news_mode=True
+                        digest["items"],
+                        digest["rendered_html"],
+                        digest["raw_response"],
+                        digest["model_used"],
                     )
-                if not is_service_message(raw_ans, lang) and needs_news_format_retry(raw_ans):
-                    format_prompt = (
-                        initial_prompt
-                        + "\nПереформатируй ответ строго по шаблону. Каждый пункт только в 2 строках: "
-                          "\"1) Страна: Заголовок — дата. Одно короткое описание.\" и на новой строке "
-                          "\"Оригинал статьи: домен, https://полная-ссылка\". "
-                          "Не начинай новый абзац с года, не оставляй голый домен без полной ссылки, не добавляй вступление или заключение."
-                    )
-                    raw_ans = generate_answer(
-                        chat_id,
-                        format_prompt,
-                        lang,
-                        use_history=False,
-                        news_mode=True
-                    )
-                if is_service_message(raw_ans, lang):
-                    compact_prompt = build_news_prompt(lang, compact=True)
-                    print(
-                        "News retry with compact prompt "
-                        f"chat_id={chat_id} lang={lang} prompt_chars={len(compact_prompt)}",
-                        flush=True,
-                    )
-                    raw_ans = generate_answer(
-                        chat_id,
-                        compact_prompt,
-                        lang,
-                        use_history=False,
-                        news_mode=True
-                    )
-                if is_service_message(raw_ans, lang):
-                    ans = raw_ans
-                else:
-                    normalized_news = enforce_news_spacing(sanitize_plain_text(raw_ans))
-                    ans = format_news_html(normalized_news, lang)
                     save_cached_news(lang, ans)
+                else:
+                    logger.warning(
+                        "News digest generation returned no items chat_id=%s lang=%s",
+                        chat_id,
+                        lang,
+                    )
+                    ans = TEXTS[lang]["error"]
         except Exception:
             logger.exception("Unhandled error in process_news_request chat_id=%s lang=%s", chat_id, lang)
             ans = TEXTS[lang]["error"]
@@ -1604,6 +1897,7 @@ def webhook():
 
     if text == "/refresh_news":
         clear_cached_news(lang)
+        clear_news_digest(lang)
         send_message(chat_id, t["searching"])
         text = t["btn_news"]
         skip_search_notice = True

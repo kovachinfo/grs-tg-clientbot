@@ -63,6 +63,25 @@ def init_db():
             ON news_cache (language_code, created_at DESC);
         """)
 
+        # Daily snapshots news digests
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS news_digests (
+                id BIGSERIAL PRIMARY KEY,
+                language_code VARCHAR(10) NOT NULL,
+                status VARCHAR(20) NOT NULL DEFAULT 'ready',
+                items_json JSONB,
+                rendered_html TEXT,
+                raw_response TEXT,
+                model_used VARCHAR(64),
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+        """)
+
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS news_digests_lang_created_idx
+            ON news_digests (language_code, created_at DESC);
+        """)
+
         conn.commit()
         cur.close()
         conn.close()
