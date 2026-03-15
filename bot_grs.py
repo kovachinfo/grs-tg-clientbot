@@ -459,7 +459,7 @@ def build_news_prompt(lang, compact=False):
             "Используй несколько независимых новостных или официальных источников, а не один сайт."
         )
         return (
-            "Подготовь сводку из 6-8 пунктов только по миграционному праву, миграционной политике и "
+            "Подготовь сводку из 8-10 пунктов только по миграционному праву, миграционной политике и "
             "процедурам легализации, которые важны для релокантов из России. "
             f"Период публикации: с {start_date.isoformat()} по {today.isoformat()}. "
             "Включай только новости об изменениях виз, ВНЖ/ПМЖ, гражданства, убежища, трудовой или "
@@ -501,7 +501,7 @@ def build_news_prompt(lang, compact=False):
         "Use several independent news or official sources instead of relying on a single site."
     )
     return (
-        "Prepare a 6-8 item summary only about migration law, migration policy, and legal status changes "
+        "Prepare a summary of 8-10 items only about migration law, migration policy, and legal status changes "
         "relevant to Russian relocators. "
         f"Publication date range: {start_date.isoformat()} to {today.isoformat()}. "
         "Include only changes to visas, residence permits, permanent residence, citizenship, asylum, work or "
@@ -801,7 +801,7 @@ def dedupe_news_items(items):
                 country_counts[country] = country_counts.get(country, 0) + 1
             deduped.append(item)
 
-    return deduped[:8]
+    return deduped[:10]
 
 
 def compress_news_item_text(item_text):
@@ -933,6 +933,137 @@ def create_response(messages, lang="ru", news_mode=False):
                 print(err_msg, flush=True)
 
     raise last_error
+
+
+def response_to_dict(response):
+    if response is None:
+        return {}
+    if hasattr(response, "model_dump"):
+        try:
+            return response.model_dump()
+        except Exception:
+            pass
+    if isinstance(response, dict):
+        return response
+    return {}
+
+
+def normalize_host(value):
+    if not value:
+        return ""
+    host = value.strip().lower()
+    if "://" in host:
+        parsed = urlparse(host)
+        host = parsed.netloc.lower()
+    host = host.split("/")[0].split(":")[0]
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def comparable_domain(value):
+    host = normalize_host(value)
+    if not host:
+        return ""
+    parts = host.split(".")
+    if len(parts) >= 2:
+        return ".".join(parts[-2:])
+    return host
+
+
+def collect_response_citations(response):
+    payload = response_to_dict(response)
+    citations = []
+    seen = set()
+
+    def visit(node):
+        if isinstance(node, dict):
+            url = node.get("url")
+            if isinstance(url, str) and url.startswith(("http://", "https://")):
+                domain = normalize_host(url)
+                if domain and domain != "api.openai.com":
+                    key = (url, domain)
+                    if key not in seen:
+                        seen.add(key)
+                        citations.append({"url": url, "domain": domain})
+            for value in node.values():
+                visit(value)
+        elif isinstance(node, list):
+            for item in node:
+                visit(item)
+
+    visit(payload)
+    return citations
+
+
+def add_url_to_news_item(item_text, citation_url, citation_domain):
+    if not citation_url or citation_url in item_text:
+        return item_text
+
+    source_pattern = r"((?:Оригинал статьи|Источник|Original article|Source):\s*[^,\n]+)"
+    if re.search(source_pattern, item_text, flags=re.I):
+        return re.sub(
+            source_pattern,
+            lambda m: f"{m.group(1)}, {citation_url}",
+            item_text,
+            count=1,
+            flags=re.I,
+        )
+
+    label = "Оригинал статьи" if re.search(r"[А-Яа-яЁё]", item_text) else "Original article"
+    suffix = "" if item_text.rstrip().endswith((".", "!", "?")) else "."
+    return f"{item_text}{suffix} {label}: {citation_domain}, {citation_url}"
+
+
+def enrich_news_text_with_citations(text, response):
+    if not text:
+        return text
+
+    citations = collect_response_citations(response)
+    if not citations:
+        return text
+
+    items = parse_news_items(text)
+    if not items:
+        return text
+
+    used_urls = set()
+    enriched_items = []
+
+    for item in items:
+        if re.search(r"https?://", item, flags=re.I):
+            enriched_items.append(item)
+            continue
+
+        item_domain = extract_news_item_domain(item)
+        item_host = normalize_host(item_domain)
+        item_cmp = comparable_domain(item_domain)
+        matched = None
+
+        for citation in citations:
+            if citation["url"] in used_urls:
+                continue
+            citation_host = normalize_host(citation["domain"])
+            citation_cmp = comparable_domain(citation["domain"])
+            if item_host and (item_host == citation_host or (item_cmp and item_cmp == citation_cmp)):
+                matched = citation
+                break
+
+        if matched:
+            used_urls.add(matched["url"])
+            enriched_items.append(add_url_to_news_item(item, matched["url"], matched["domain"]))
+        else:
+            enriched_items.append(item)
+
+    return "\n\n".join(enriched_items).strip()
+
+
+def extract_response_text(response, news_mode=False):
+    text = (response.output_text or "").strip()
+    if news_mode:
+        text = enrich_news_text_with_citations(text, response)
+    return text
+
 
 def escape_html(text):
     if text is None:
@@ -1126,7 +1257,7 @@ def generate_answer(chat_id, user_message, lang="ru", use_history=True, news_mod
 
     try:
         response, model_used = create_response(messages, lang=lang, news_mode=news_mode)
-        content = (response.output_text or "").strip()
+        content = extract_response_text(response, news_mode=news_mode)
         content_l = content.lower()
 
         if (
@@ -1142,7 +1273,7 @@ def generate_answer(chat_id, user_message, lang="ru", use_history=True, news_mod
             )
             retry_messages = messages + [{"role": "user", "content": retry_rule}]
             retry, _ = create_response(retry_messages, lang=lang, news_mode=news_mode)
-            return (retry.output_text or "").strip()
+            return extract_response_text(retry, news_mode=news_mode)
 
         if news_mode and needs_news_retry(content):
             retry_rule = (
@@ -1154,7 +1285,7 @@ def generate_answer(chat_id, user_message, lang="ru", use_history=True, news_mod
             )
             retry_messages = messages + [{"role": "user", "content": retry_rule}]
             retry, _ = create_response(retry_messages, lang=lang, news_mode=news_mode)
-            content = (retry.output_text or "").strip()
+            content = extract_response_text(retry, news_mode=news_mode)
 
         logger.info("OpenAI response completed with model=%s news_mode=%s", model_used, news_mode)
         return sanitize_plain_text(content, preserve_urls=news_mode) if news_mode else content
@@ -1170,7 +1301,7 @@ def generate_answer(chat_id, user_message, lang="ru", use_history=True, news_mod
         for fallback_model in fallback_candidates:
             try:
                 fb = client.responses.create(model=fallback_model, input=messages)
-                fb_text = (fb.output_text or "").strip()
+                fb_text = extract_response_text(fb, news_mode=news_mode)
                 return sanitize_plain_text(fb_text, preserve_urls=news_mode) if news_mode else fb_text
             except Exception as fb_err:
                 last_fb_error = fb_err
