@@ -34,7 +34,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = (os.getenv("OPENAI_MODEL") or "gpt-5-mini").strip()
-OPENAI_NEWS_MODEL = (os.getenv("OPENAI_NEWS_MODEL") or "gpt-5-mini").strip()
+OPENAI_NEWS_MODEL = (os.getenv("OPENAI_NEWS_MODEL") or "gpt-5").strip()
 OPENAI_ENABLE_NEWS_FILTERS = os.getenv("OPENAI_ENABLE_NEWS_FILTERS", "false").lower() == "true"
 MANAGER_USERNAME = os.getenv("MANAGER_USERNAME", "globalrelocationsolutions_cz").lstrip("@")
 OPENAI_FALLBACK_MODELS_RAW = os.getenv("OPENAI_FALLBACK_MODELS") or "gpt-5,gpt-4.1,gpt-4o"
@@ -450,9 +450,11 @@ def build_news_prompt(lang, compact=False):
 
     if lang == "ru":
         domain_rule = (
-            "Используй только материалы с этих доменов: "
-            f"{', '.join(allowed_domains)}. Если релевантных материалов на них мало, "
-            "не выдумывай и прямо напиши, что выборка ограничена указанными источниками."
+            "Используй эти домены как основной пул источников: "
+            f"{', '.join(allowed_domains)}. Старайся брать новости минимум с 3 разных доменов, "
+            "если по теме есть достаточно материалов. Не давай больше 2 пунктов с одного домена, "
+            "если можно собрать более разнообразную выборку. Если релевантных материалов мало, "
+            "прямо напиши, что выборка ограничена указанными источниками."
             if allowed_domains else
             "Используй несколько независимых новостных или официальных источников, а не один сайт."
         )
@@ -484,15 +486,17 @@ def build_news_prompt(lang, compact=False):
             "\"1) Заголовок — дата. Короткое описание. Почему важно: ... Источник: Название статьи, домен\". "
             "Пиши компактно: каждый пункт максимум 2 коротких предложения после заголовка, примерно на 20% короче обычной новости, "
             "без потери ключевого смысла. Не дублируй один и тот же сюжет, страну+событие или один и тот же источник по одной теме. "
+            "Не добавляй вступление, преамбулу, общий абзац перед списком или заключение после списка. Выведи только нумерованный список. "
             "Если статья не проходит хотя бы по двум позитивным признакам или попадает под негативные признаки, не включай ее. "
             "Не используй Wikipedia или любые вики-источники. Не давай прямые ссылки. "
             "Если релевантных новостей меньше 6, верни меньше и явно сообщи, что значимых материалов мало."
         )
 
     domain_rule = (
-        "Use only these domains: "
-        f"{', '.join(allowed_domains)}. If they do not contain enough relevant items, say the sample is limited "
-        "instead of filling the list with unrelated news."
+        "Use these domains as the primary source pool: "
+        f"{', '.join(allowed_domains)}. Try to use at least 3 different domains when enough relevant material exists. "
+        "Do not use more than 2 items from the same domain if a more diverse selection is available. "
+        "If the pool is too limited, explicitly say so instead of filling the list with unrelated items."
         if allowed_domains else
         "Use several independent news or official sources instead of relying on a single site."
     )
@@ -523,6 +527,7 @@ def build_news_prompt(lang, compact=False):
         "\"1) Title — date. Short description. Why it matters: ... Source: Article title, domain\". "
         "Be concise: each item should be at most 2 short sentences after the title, about 20% shorter than a typical news brief, "
         "without losing the key meaning. Do not include duplicate events, duplicate country+event pairs, or the same story twice. "
+        "Do not add any introduction, preamble, summary paragraph before the list, or closing paragraph after the list. Output only the numbered list. "
         "If an article does not satisfy at least two positive signals or hits negative signals, exclude it. "
         "Do not use Wikipedia or other wiki sources. Do not include direct links. "
         "If fewer than 6 relevant items exist, return fewer and explicitly say the pool was limited."
@@ -664,6 +669,7 @@ def sanitize_plain_text(text):
     if not text:
         return text
 
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
     text = re.sub(r"__([^_]+)__", r"\1", text)
     text = re.sub(r"`([^`]+)`", r"\1", text)
@@ -671,7 +677,8 @@ def sanitize_plain_text(text):
     text = re.sub(r"https?://\S+", "", text)
     text = re.sub(r"^\s*[-*]\s+", "- ", text, flags=re.M)
     text = re.sub(r"\b([a-z0-9.-]+\.[a-z]{2,})\.\s+\(\1\b", r"\1 (", text, flags=re.I)
-    text = re.sub(r"\s{2,}", " ", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
 
@@ -679,14 +686,20 @@ def parse_news_items(text):
     if not text:
         return []
 
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    normalized = sanitize_plain_text(text)
+    normalized = re.sub(r"(?<!\n)\s+(?=\d+[\).]\s+)", "\n", normalized)
+    lines = [ln.strip() for ln in normalized.splitlines() if ln.strip()]
     items = []
     current = []
+    seen_numbered_item = False
     for ln in lines:
         if re.match(r"^\d+[\).]\s+", ln):
+            seen_numbered_item = True
             if current:
                 items.append(" ".join(current).strip())
                 current = []
+        elif not seen_numbered_item:
+            continue
         current.append(ln)
 
     if current:
@@ -706,15 +719,29 @@ def normalize_news_item_key(item_text):
     return " ".join(words[:12])
 
 
+def extract_news_item_domain(item_text):
+    match = re.search(r"(?:источник|source):.*?([a-z0-9.-]+\.[a-z]{2,})", item_text, flags=re.I)
+    if match:
+        return match.group(1).lower()
+    fallback = re.findall(r"\b([a-z0-9.-]+\.[a-z]{2,})\b", item_text, flags=re.I)
+    return fallback[-1].lower() if fallback else ""
+
+
 def dedupe_news_items(items):
     deduped = []
     seen = set()
+    domain_counts = {}
 
     for item in items:
         key = normalize_news_item_key(item)
         if not key or key in seen:
             continue
+        domain = extract_news_item_domain(item)
+        if domain and domain_counts.get(domain, 0) >= 2 and len(deduped) >= 4:
+            continue
         seen.add(key)
+        if domain:
+            domain_counts[domain] = domain_counts.get(domain, 0) + 1
         deduped.append(item)
 
     return deduped[:8]
@@ -850,14 +877,34 @@ def escape_html(text):
     )
 
 def bold_title(item_text):
-    for delim in [" — ", " - ", " —", " -"]:
-        if delim in item_text:
-            title, rest = item_text.split(delim, 1)
-            return f"<b>{title.strip()}</b>{delim}{rest.strip()}"
-    if ":" in item_text:
-        title, rest = item_text.split(":", 1)
-        return f"<b>{title.strip()}</b>: {rest.strip()}"
-    return f"<b>{item_text.strip()}</b>"
+    numbered_prefix = ""
+    body = item_text.strip()
+
+    match = re.match(r"^(\d+[\).]\s+)(.+)$", body)
+    if match:
+        numbered_prefix = match.group(1)
+        body = match.group(2).strip()
+
+    split_match = re.match(
+        r"^(.*?)(\s+[—-]\s+\d{1,2}[./ ]\d{1,2}[./ ]\d{2,4}\.?.*)$",
+        body
+    )
+    if split_match:
+        title = split_match.group(1).strip()
+        rest = split_match.group(2).strip()
+        return f"{numbered_prefix}<b>{title}</b> {rest}".strip()
+
+    for marker in [" Почему важно:", " Источник:"]:
+        if marker in body:
+            title, rest = body.split(marker, 1)
+            return f"{numbered_prefix}<b>{title.strip()}</b>{marker}{rest.strip()}".strip()
+
+    for delim in [" — ", " - "]:
+        if delim in body:
+            title, rest = body.split(delim, 1)
+            return f"{numbered_prefix}<b>{title.strip()}</b>{delim}{rest.strip()}".strip()
+
+    return f"{numbered_prefix}<b>{body}</b>".strip()
 
 def format_news_html(text, lang):
     header = (
