@@ -568,6 +568,10 @@ def get_cached_news(lang):
                 created_at = row["created_at"]
                 age_sec = (time.time() - created_at.timestamp())
                 if age_sec <= NEWS_CACHE_TTL_SEC:
+                    if is_invalid_cached_news(row["content"]):
+                        logger.warning("Ignoring invalid cached news for lang=%s", lang)
+                        print(f"Ignoring invalid cached news for lang={lang}", flush=True)
+                        return None
                     return row["content"]
                 return None
     except Exception as e:
@@ -624,6 +628,23 @@ def needs_news_retry(text):
 
 def is_service_message(text, lang):
     return text in {TEXTS[lang]["error"], TEXTS[lang]["rate_limited"]}
+
+
+def is_invalid_cached_news(text):
+    if not text:
+        return True
+
+    error_markers = [
+        TEXTS["ru"]["error"],
+        TEXTS["ru"]["rate_limited"],
+        TEXTS["en"]["error"],
+        TEXTS["en"]["rate_limited"],
+        "service error",
+        "rate limited",
+        "rate limit",
+    ]
+    lower = text.lower()
+    return any(marker.lower() in lower for marker in error_markers)
 
 
 def build_web_search_tool(news_mode=False, include_filters=True):
