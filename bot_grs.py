@@ -5,12 +5,12 @@ import time
 import threading
 import re
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 from importlib.metadata import PackageNotFoundError, version
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
-from flask import Flask, request
+from flask import Flask, jsonify, request
 from openai import OpenAI
 from psycopg2.extras import Json
 
@@ -40,6 +40,8 @@ OPENAI_NEWS_MODEL = (os.getenv("OPENAI_NEWS_MODEL") or "gpt-4.1").strip()
 OPENAI_ENABLE_NEWS_FILTERS = os.getenv("OPENAI_ENABLE_NEWS_FILTERS", "false").lower() == "true"
 MANAGER_USERNAME = os.getenv("MANAGER_USERNAME", "globalrelocationsolutions_cz").lstrip("@")
 OPENAI_FALLBACK_MODELS_RAW = os.getenv("OPENAI_FALLBACK_MODELS") or "gpt-5,gpt-4.1,gpt-4o"
+NEWS_CRON_TOKEN = os.getenv("NEWS_CRON_TOKEN", "")
+NEWS_ADMIN_CHAT_ID = int(os.getenv("NEWS_ADMIN_CHAT_ID", "1111827435"))
 
 try:
     OPENAI_TIMEOUT_SEC = float(os.getenv("OPENAI_TIMEOUT_SEC", "45"))
@@ -58,6 +60,9 @@ TELEGRAM_MAX_MESSAGE_LEN = 4096
 REQUEST_TIMEOUT_SEC = 15
 PROCESSED_UPDATE_TTL_SEC = 10 * 60
 TARGET_NEWS_ITEMS = 10
+CANDIDATE_NEWS_ITEMS = 16
+MAX_NEWS_PER_DOMAIN = 2
+READY_NEWS_MIN_ITEMS = 10
 
 processed_updates = {}
 processed_updates_lock = threading.Lock()
@@ -594,19 +599,20 @@ def build_news_snapshot_prompt(lang):
             "Используй несколько независимых источников. "
         )
         return (
-            f"Найди до {TARGET_NEWS_ITEMS} самых полезных новостей для релокантов из России за период "
+            f"Найди {CANDIDATE_NEWS_ITEMS - 2}-{CANDIDATE_NEWS_ITEMS} кандидатов для новостного дайджеста релокантов из России за период "
             f"с {start_date.isoformat()} по {today.isoformat()}. "
             "Темы: визы, ВНЖ/ПМЖ, гражданство, правила въезда, трудовая и учебная миграция, digital nomad, "
             "воссоединение семьи, легализация, консульские ограничения. "
-            "Приоритет: разные страны и разные домены; не больше 2 новостей из одной страны, если есть альтернатива. "
+            "Приоритет: разные страны и разные домены; не больше 2 новостей с одного домена, если есть альтернатива. "
             "Не включай общие гайды, обзоры услуг, внутренние новости РФ без прямого влияния на релокацию, спорт, криминал, вакансии. "
             + domain_rule
             + "Если точной статьи нет, не придумывай ее. Нужна только оригинальная статья, а не главная страница сайта. "
             "Верни ТОЛЬКО JSON-массив объектов без markdown и без пояснений. "
             "Поля каждого объекта: country, title, date, summary, source_domain, source_url. "
-            "summary: одно короткое описание в 1-2 предложениях. "
-            "date: как в статье или новости, строкой. "
+            "summary: информативное описание в 2-3 предложениях, примерно в 2 раза подробнее короткой заметки. "
+            "date: точная дата публикации или изменения, строкой, без формулировок вроде '3 месяца назад'. "
             "source_url: полный URL оригинальной статьи. "
+            "Не используй homepage, category page, evergreen guide или маркетинговую страницу, если нет конкретного свежего изменения. "
             "Короткий список допустимых источников и разделов:\n"
             + f"{source_profiles}"
         )
@@ -617,19 +623,20 @@ def build_news_snapshot_prompt(lang):
         "Use several independent sources. "
     )
     return (
-        f"Find up to {TARGET_NEWS_ITEMS} most useful news items for Russian relocators from "
+        f"Find {CANDIDATE_NEWS_ITEMS - 2}-{CANDIDATE_NEWS_ITEMS} candidate news items for a Russian relocator digest from "
         f"{start_date.isoformat()} to {today.isoformat()}. "
         "Topics: visas, residence permits, citizenship, entry rules, work and study migration, digital nomads, "
         "family reunion, legalization, consular restrictions. Prioritize different countries and different domains; "
-        "avoid more than 2 items from one country if alternatives exist. "
+        "avoid more than 2 items from one domain if alternatives exist. "
         "Exclude generic guides, service pages, Russia-only domestic news without relocation impact, sports, crime, vacancies. "
         + domain_rule
         + "If there is no exact article, do not invent it. Only original article URLs, not site homepages. "
         "Return ONLY a JSON array of objects, no markdown and no explanations. "
         "Fields for each object: country, title, date, summary, source_domain, source_url. "
-        "summary: one short description in 1-2 sentences. "
-        "date: keep as a string from the article. "
+        "summary: informative 2-3 sentence description, about twice as detailed as a short brief. "
+        "date: exact publication or change date as a string, without relative dates like '3 months ago'. "
         "source_url: full original article URL. "
+        "Do not use site homepages, category pages, evergreen guides, or marketing pages unless they clearly contain a fresh policy change. "
         "Allowed source list and sections:\n"
         + f"{source_profiles}"
     )
@@ -764,7 +771,7 @@ def clear_cached_news(lang=None):
         logger.error(f"Error clearing cached news: {e}")
 
 
-def get_latest_news_digest(lang):
+def get_latest_news_digest(lang, allow_stale=False):
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
@@ -783,15 +790,16 @@ def get_latest_news_digest(lang):
                     return None
 
                 age_sec = time.time() - row["created_at"].timestamp()
-                if age_sec > NEWS_CACHE_TTL_SEC:
+                if age_sec > NEWS_CACHE_TTL_SEC and not allow_stale:
                     return None
+                row["age_sec"] = age_sec
                 return row
     except Exception as e:
         logger.error(f"Error getting latest news digest: {e}")
         return None
 
 
-def save_news_digest(lang, items, rendered_html, raw_response, model_used):
+def save_news_digest(lang, items, rendered_html, raw_response, model_used, status="ready"):
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
@@ -804,9 +812,9 @@ def save_news_digest(lang, items, rendered_html, raw_response, model_used):
                         rendered_html,
                         raw_response,
                         model_used
-                    ) VALUES (%s, 'ready', %s, %s, %s, %s)
+                    ) VALUES (%s, %s, %s, %s, %s, %s)
                     """,
-                    (lang, Json(items), rendered_html, raw_response, model_used),
+                    (lang, status, Json(items), rendered_html, raw_response, model_used),
                 )
                 conn.commit()
     except Exception as e:
@@ -824,6 +832,162 @@ def clear_news_digest(lang=None):
                 conn.commit()
     except Exception as e:
         logger.error(f"Error clearing news digest: {e}")
+
+
+def is_admin_news_chat(chat_id):
+    return chat_id == NEWS_ADMIN_CHAT_ID
+
+
+def pending_news_message(lang):
+    if lang == "ru":
+        return "🛠 Новостной дайджест ещё обновляется. Пока показываю только последний готовый snapshot."
+    return "🛠 The news digest is still refreshing. Only the last ready snapshot is available for now."
+
+
+def parse_article_date(raw_value):
+    if not raw_value:
+        return None
+
+    value = raw_value.strip()
+    value = re.sub(r"\s+", " ", value)
+    value = re.sub(
+        r"(?:≈|~|около|примерно|about|around)\s*\d+\s*"
+        r"(?:дн(?:я|ей)?|недел(?:я|и|ь)?|месяц(?:а|ев)?|год(?:а|ов)?|лет|"
+        r"day(?:s)?|week(?:s)?|month(?:s)?|year(?:s)?)\s*(?:назад|ago)?",
+        "",
+        value,
+        flags=re.I,
+    ).strip(" -—,.;")
+    if not value:
+        return None
+
+    month_map = {
+        "января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6,
+        "июля": 7, "августа": 8, "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12,
+        "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+        "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
+    }
+
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(value, fmt).date()
+        except ValueError:
+            pass
+
+    match = re.search(r"(\d{1,2})\s+([A-Za-zА-Яа-яЁё]+)\s+(\d{4})", value)
+    if match:
+        day_num = int(match.group(1))
+        month_name = match.group(2).lower()
+        year_num = int(match.group(3))
+        month_num = month_map.get(month_name)
+        if month_num:
+            try:
+                return date(year_num, month_num, day_num)
+            except ValueError:
+                return None
+
+    return None
+
+
+def get_news_pool_rows(lang, active_only=False):
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                if active_only:
+                    cur.execute(
+                        """
+                        SELECT *
+                        FROM news_digest_pool
+                        WHERE language_code = %s AND is_active = TRUE
+                        ORDER BY article_date DESC NULLS LAST, discovered_at DESC
+                        """,
+                        (lang,),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT *
+                        FROM news_digest_pool
+                        WHERE language_code = %s
+                        ORDER BY article_date DESC NULLS LAST, discovered_at DESC
+                        """,
+                        (lang,),
+                    )
+                return cur.fetchall()
+    except Exception as e:
+        logger.error(f"Error loading news pool rows: {e}")
+        return []
+
+
+def upsert_news_pool_item(lang, item):
+    article_date = parse_article_date(item.get("date", ""))
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO news_digest_pool (
+                        language_code,
+                        source_url,
+                        source_domain,
+                        title,
+                        summary,
+                        country,
+                        article_date_raw,
+                        article_date,
+                        is_active
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, FALSE)
+                    ON CONFLICT (language_code, source_url)
+                    DO UPDATE SET
+                        source_domain = EXCLUDED.source_domain,
+                        title = EXCLUDED.title,
+                        summary = EXCLUDED.summary,
+                        country = EXCLUDED.country,
+                        article_date_raw = EXCLUDED.article_date_raw,
+                        article_date = EXCLUDED.article_date,
+                        updated_at = NOW()
+                    RETURNING id, discovered_at, updated_at, is_active
+                    """,
+                    (
+                        lang,
+                        item["source_url"],
+                        item["source_domain"],
+                        item["title"],
+                        item["summary"],
+                        item.get("country"),
+                        item.get("date"),
+                        article_date,
+                    ),
+                )
+                row = cur.fetchone()
+                conn.commit()
+                return row
+    except Exception as e:
+        logger.error(f"Error upserting news pool item: {e}")
+        return None
+
+
+def set_active_news_pool_items(lang, active_urls):
+    active_urls = list(active_urls)
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE news_digest_pool SET is_active = FALSE, updated_at = NOW() WHERE language_code = %s",
+                    (lang,),
+                )
+                if active_urls:
+                    cur.execute(
+                        """
+                        UPDATE news_digest_pool
+                        SET is_active = TRUE, updated_at = NOW()
+                        WHERE language_code = %s AND source_url = ANY(%s)
+                        """,
+                        (lang, active_urls),
+                    )
+                conn.commit()
+    except Exception as e:
+        logger.error(f"Error updating active news pool items: {e}")
 
 # ---------------------------------------------
 # Очистка простого текста (без Markdown)
@@ -1400,6 +1564,16 @@ def normalize_digest_item(item):
     if not title or not summary:
         return None
 
+    relative_date_pattern = (
+        r"(?:≈|~|около|примерно|about|around)?\s*\d+\s*"
+        r"(?:дн(?:я|ей)?|недел(?:я|и|ь)?|месяц(?:а|ев)?|год(?:а|ов)?|лет|"
+        r"day(?:s)?|week(?:s)?|month(?:s)?|year(?:s)?)\s*(?:назад|ago)?"
+    )
+
+    title = re.sub(relative_date_pattern, "", title, flags=re.I).strip(" \n\t-—,;.")
+    title = re.sub(r"^[A-Za-zА-Яа-яЁё0-9/ —-]{2,40}:\s+", "", title).strip()
+    date = re.sub(relative_date_pattern, "", date, flags=re.I).strip(" \n\t-—,;.")
+
     if not country:
         country = extract_news_item_country(f"{title}") or ""
     if not country:
@@ -1407,9 +1581,14 @@ def normalize_digest_item(item):
 
     summary = sanitize_plain_text(summary, preserve_urls=True)
     summary = re.sub(r"\s{2,}", " ", summary).strip(" \n\t-—,;.")
-    sentences = re.split(r"(?<=[.!?])\s+", summary)
-    if len(sentences) > 2:
-        summary = " ".join(sentences[:2]).strip()
+    summary = re.sub(relative_date_pattern, "", summary, flags=re.I).strip(" \n\t-—,;.")
+    sentences = [sentence.strip() for sentence in re.split(r"(?<=[.!?])\s+", summary) if sentence.strip()]
+    if len(sentences) > 3:
+        summary = " ".join(sentences[:3]).strip()
+    if len(summary) < 90 or not source_url:
+        return None
+
+    article_date = parse_article_date(date)
 
     return {
         "country": country,
@@ -1418,6 +1597,8 @@ def normalize_digest_item(item):
         "summary": summary,
         "source_domain": source_domain,
         "source_url": source_url,
+        "article_date": article_date,
+        "normalized_title_key": normalize_news_item_key(f"{source_domain} {title}"),
     }
 
 
@@ -1453,32 +1634,114 @@ def enrich_digest_items_with_citations(items, response):
 
 def dedupe_digest_items(items):
     deduped = []
-    seen = set()
-    country_counts = {}
+    seen_urls = set()
+    seen_fallback = set()
     domain_counts = {}
 
-    for item in items:
-        key = normalize_news_item_key(
-            f"{item.get('country', '')}: {item.get('title', '')} {item.get('summary', '')}"
+    def sort_key(item):
+        article_date = item.get("article_date")
+        if article_date:
+            return (0, -article_date.toordinal(), item.get("source_url", ""))
+        return (1, 0, item.get("source_url", ""))
+
+    for item in sorted(items, key=sort_key):
+        source_url = item.get("source_url", "")
+        fallback_key = item.get("normalized_title_key") or normalize_news_item_key(
+            f"{item.get('source_domain', '')} {item.get('title', '')}"
         )
-        if not key or key in seen:
+        if not source_url and not fallback_key:
+            continue
+        if source_url and source_url in seen_urls:
+            continue
+        if fallback_key and fallback_key in seen_fallback:
             continue
 
-        country = item.get("country", "").strip().lower()
         domain = item.get("source_domain", "").strip().lower()
-        if country and country_counts.get(country, 0) >= 2 and len(deduped) >= 6:
-            continue
-        if domain and domain_counts.get(domain, 0) >= 3 and len(deduped) >= 6:
+        if domain and domain_counts.get(domain, 0) >= MAX_NEWS_PER_DOMAIN:
             continue
 
-        seen.add(key)
-        if country:
-            country_counts[country] = country_counts.get(country, 0) + 1
+        if source_url:
+            seen_urls.add(source_url)
+        if fallback_key:
+            seen_fallback.add(fallback_key)
         if domain:
             domain_counts[domain] = domain_counts.get(domain, 0) + 1
-        deduped.append(item)
+
+        deduped.append(dict(item))
 
     return deduped[:TARGET_NEWS_ITEMS]
+
+
+def evaluate_digest_quality(items):
+    domains = {item.get("source_domain") for item in items if item.get("source_domain")}
+    urls = sum(1 for item in items if item.get("source_url"))
+    domain_limit_ok = all(
+        sum(1 for item in items if item.get("source_domain") == domain) <= MAX_NEWS_PER_DOMAIN
+        for domain in domains
+    )
+    has_relative_dates = any(
+        re.search(
+            r"(?:≈|~|около|примерно|about|around)?\s*\d+\s*"
+            r"(?:дн(?:я|ей)?|недел(?:я|и|ь)?|месяц(?:а|ев)?|год(?:а|ов)?|лет|"
+            r"day(?:s)?|week(?:s)?|month(?:s)?|year(?:s)?)\s*(?:назад|ago)?",
+            item.get("date", ""),
+            flags=re.I,
+        )
+        for item in items
+    )
+    return {
+        "item_count": len(items),
+        "domains": len(domains),
+        "urls": urls,
+        "domain_limit_ok": domain_limit_ok,
+        "has_relative_dates": has_relative_dates,
+    }
+
+
+def is_digest_ready(items):
+    quality = evaluate_digest_quality(items)
+    return (
+        quality["item_count"] == READY_NEWS_MIN_ITEMS
+        and quality["domains"] >= 3
+        and quality["urls"] == READY_NEWS_MIN_ITEMS
+        and quality["domain_limit_ok"]
+        and not quality["has_relative_dates"]
+    )
+
+
+def row_to_digest_item(row):
+    article_date = row.get("article_date")
+    if article_date and isinstance(article_date, datetime):
+        article_date = article_date.date()
+    return {
+        "id": row.get("id"),
+        "country": row.get("country") or "",
+        "title": row.get("title") or "",
+        "date": row.get("article_date_raw") or "",
+        "summary": row.get("summary") or "",
+        "source_domain": row.get("source_domain") or "",
+        "source_url": row.get("source_url") or "",
+        "article_date": article_date if isinstance(article_date, date) else None,
+        "normalized_title_key": normalize_news_item_key(
+            f"{row.get('source_domain', '')} {row.get('title', '')}"
+        ),
+    }
+
+
+def merge_news_pool_items(existing_active_items, new_candidate_items):
+    if not new_candidate_items:
+        return dedupe_digest_items(existing_active_items)
+
+    merged = {}
+    for item in existing_active_items:
+        if item.get("source_url"):
+            merged[item["source_url"]] = dict(item)
+
+    for item in new_candidate_items:
+        if item.get("source_url"):
+            merged[item["source_url"]] = dict(item)
+
+    return dedupe_digest_items(list(merged.values()))
 
 
 def render_news_digest_html(items, lang):
@@ -1490,16 +1753,12 @@ def render_news_digest_html(items, lang):
 
     formatted = []
     source_label = "Оригинал статьи" if lang == "ru" else "Original article"
-    link_label = "ссылка на оригинал" if lang == "ru" else "original link"
 
     for index, item in enumerate(items, start=1):
-        country = escape_html(item.get("country", "").strip())
         title = escape_html(item.get("title", "").strip())
         date = escape_html(item.get("date", "").strip())
         summary = escape_html(item.get("summary", "").strip())
-        lead = f"{index}) {country}: {title}"
-        if date:
-            lead += f" — {date}"
+        lead = f"{index}) {title}"
         if summary:
             lead += f". {summary}"
 
@@ -1507,18 +1766,20 @@ def render_news_digest_html(items, lang):
         url = item.get("source_url", "").strip()
 
         if url and domain:
-            source_line = (
-                f"{source_label}: {domain} - "
-                f"<a href=\"{escape_html_attr(url)}\">{link_label}</a>"
-            )
+            source_line = f"{source_label}: <a href=\"{escape_html_attr(url)}\">{domain}</a>"
         elif url:
-            source_line = f"{source_label}: <a href=\"{escape_html_attr(url)}\">{link_label}</a>"
+            source_line = f"{source_label}: <a href=\"{escape_html_attr(url)}\">{escape_html(url)}</a>"
         elif domain:
             source_line = f"{source_label}: {domain}"
         else:
             source_line = ""
 
-        formatted.append(f"{lead}\n{source_line}".strip())
+        block_lines = [lead]
+        if source_line:
+            block_lines.append(source_line)
+        if date:
+            block_lines.append(date)
+        formatted.append("\n".join(block_lines).strip())
 
     return f"{escape_html(header)}\n\n" + "\n\n".join(formatted)
 
@@ -1567,10 +1828,87 @@ def build_news_digest(chat_id, lang):
         }
         if len(candidate["items"]) > len(best_result["items"]):
             best_result = candidate
-        if len(candidate["items"]) >= 8:
+        if len(candidate["items"]) >= READY_NEWS_MIN_ITEMS:
             return candidate
 
     return best_result
+
+
+def refresh_news_digest(lang="ru", force=False, chat_id=None):
+    latest_ready = get_latest_news_digest(lang, allow_stale=True)
+    if latest_ready and not force and latest_ready.get("age_sec", NEWS_CACHE_TTL_SEC + 1) < NEWS_CACHE_TTL_SEC:
+        return {
+            "status": "skipped",
+            "reason": "ready_digest_is_fresh",
+            "item_count": len(latest_ready.get("items_json") or []),
+            "updated": False,
+        }
+
+    existing_active_rows = get_news_pool_rows(lang, active_only=True)
+    existing_active_items = [row_to_digest_item(row) for row in existing_active_rows]
+    existing_active_urls = {item["source_url"] for item in existing_active_items if item.get("source_url")}
+
+    digest = build_news_digest(chat_id or 0, lang)
+    candidate_items = digest["items"]
+    new_candidate_items = [item for item in candidate_items if item.get("source_url") not in existing_active_urls]
+
+    for item in candidate_items:
+        upsert_news_pool_item(lang, item)
+
+    if not new_candidate_items and existing_active_items:
+        final_items = dedupe_digest_items(existing_active_items)
+        quality = evaluate_digest_quality(final_items)
+        return {
+            "status": "unchanged",
+            "updated": False,
+            "new_count": 0,
+            "item_count": quality["item_count"],
+            "domains": quality["domains"],
+            "urls": quality["urls"],
+        }
+
+    final_items = merge_news_pool_items(existing_active_items, new_candidate_items)
+    quality = evaluate_digest_quality(final_items)
+
+    if is_digest_ready(final_items):
+        set_active_news_pool_items(
+            lang,
+            [item["source_url"] for item in final_items if item.get("source_url")],
+        )
+        rendered_html = render_news_digest_html(final_items, lang)
+        save_news_digest(
+            lang,
+            final_items,
+            rendered_html,
+            digest["raw_response"],
+            digest["model_used"],
+            status="ready",
+        )
+        return {
+            "status": "ready",
+            "updated": bool(new_candidate_items),
+            "new_count": len(new_candidate_items),
+            "item_count": len(final_items),
+            "domains": quality["domains"],
+            "urls": quality["urls"],
+        }
+
+    save_news_digest(
+        lang,
+        final_items or candidate_items,
+        render_news_digest_html(final_items or candidate_items, lang) if (final_items or candidate_items) else "",
+        digest["raw_response"],
+        digest["model_used"],
+        status="draft" if candidate_items else "failed",
+    )
+    return {
+        "status": "draft" if candidate_items else "failed",
+        "updated": False,
+        "new_count": len(new_candidate_items),
+        "item_count": quality["item_count"],
+        "domains": quality["domains"],
+        "urls": quality["urls"],
+    }
 
 
 def escape_html(text):
@@ -1871,7 +2209,7 @@ def make_news_job_key(chat_id, lang):
     return f"{chat_id}:{lang}"
 
 
-def process_news_request(chat_id, lang, trigger_text):
+def process_news_refresh_request(chat_id, lang, trigger_text, force=False):
     job_key = make_news_job_key(chat_id, lang)
     stop_event = threading.Event()
     typing_thread = threading.Thread(
@@ -1883,35 +2221,30 @@ def process_news_request(chat_id, lang, trigger_text):
 
     try:
         try:
-            cached_digest = get_latest_news_digest(lang)
-            if cached_digest and cached_digest.get("rendered_html"):
-                ans = cached_digest["rendered_html"]
+            result = refresh_news_digest(lang=lang, force=force, chat_id=chat_id)
+            if lang == "ru":
+                ans = (
+                    "🛠 Обновление дайджеста завершено.\n"
+                    f"Статус: {result['status']}\n"
+                    f"Новых новостей: {result.get('new_count', 0)}\n"
+                    f"Пунктов в подборке: {result.get('item_count', 0)}\n"
+                    f"Доменов: {result.get('domains', 0)}"
+                )
             else:
-                digest = build_news_digest(chat_id, lang)
-                if digest["items"]:
-                    ans = digest["rendered_html"]
-                    save_news_digest(
-                        lang,
-                        digest["items"],
-                        digest["rendered_html"],
-                        digest["raw_response"],
-                        digest["model_used"],
-                    )
-                    save_cached_news(lang, ans)
-                else:
-                    logger.warning(
-                        "News digest generation returned no items chat_id=%s lang=%s",
-                        chat_id,
-                        lang,
-                    )
-                    ans = TEXTS[lang]["error"]
+                ans = (
+                    "🛠 Digest refresh completed.\n"
+                    f"Status: {result['status']}\n"
+                    f"New items: {result.get('new_count', 0)}\n"
+                    f"Items in digest: {result.get('item_count', 0)}\n"
+                    f"Domains: {result.get('domains', 0)}"
+                )
         except Exception:
-            logger.exception("Unhandled error in process_news_request chat_id=%s lang=%s", chat_id, lang)
+            logger.exception("Unhandled error in process_news_refresh_request chat_id=%s lang=%s", chat_id, lang)
             ans = TEXTS[lang]["error"]
 
         save_message(chat_id, "user", trigger_text)
         save_message(chat_id, "assistant", ans)
-        send_message(chat_id, ans, parse_mode="HTML")
+        send_message(chat_id, ans)
     finally:
         stop_event.set()
         with active_news_jobs_lock:
@@ -1935,6 +2268,18 @@ def get_lang_keyboard():
         "resize_keyboard": True,
         "one_time_keyboard": True
     }
+
+
+@app.route("/tasks/refresh-news-digest", methods=["POST", "GET"])
+def refresh_news_digest_task():
+    token = request.headers.get("X-News-Cron-Token") or request.args.get("token")
+    if not NEWS_CRON_TOKEN or token != NEWS_CRON_TOKEN:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    lang = request.args.get("lang", "ru")
+    force = request.args.get("force", "0").lower() in {"1", "true", "yes"}
+    result = refresh_news_digest(lang=lang, force=force)
+    return jsonify({"ok": True, **result})
 
 # ---------------------------------------------
 # Webhook
@@ -1986,11 +2331,26 @@ def webhook():
         return "ok"
 
     if text == "/refresh_news":
-        clear_cached_news(lang)
-        clear_news_digest(lang)
+        if not is_admin_news_chat(chat_id):
+            send_message(chat_id, pending_news_message(lang))
+            return "ok"
+
+        job_key = make_news_job_key(chat_id, lang)
+        with active_news_jobs_lock:
+            if job_key in active_news_jobs:
+                logger.info("News refresh job already active for %s", job_key)
+                print(f"News refresh job already active for {job_key}", flush=True)
+                return "ok"
+            active_news_jobs.add(job_key)
+
         send_message(chat_id, t["searching"])
-        text = t["btn_news"]
-        skip_search_notice = True
+        worker = threading.Thread(
+            target=process_news_refresh_request,
+            args=(chat_id, lang, text, True),
+            daemon=True
+        )
+        worker.start()
+        return "ok"
 
     # Смена языка
     if text == TEXTS["ru"]["btn_ru"] or text == "🇷🇺 Русский":
@@ -2014,29 +2374,11 @@ def webhook():
         return "ok"
 
     if text in [ru_t["btn_news"], en_t["btn_news"]]:
-        # Проверяем лимит перед новостями (это тоже запрос)
-        if user['request_count'] >= MAX_FREE_REQUESTS and not user.get('is_premium'):
-            send_message(chat_id, format_limit_reached_message(lang))
-            return "ok"
-
-        job_key = make_news_job_key(chat_id, lang)
-        with active_news_jobs_lock:
-            if job_key in active_news_jobs:
-                logger.info("News job already active for %s", job_key)
-                print(f"News job already active for {job_key}", flush=True)
-                return "ok"
-            active_news_jobs.add(job_key)
-
-        if not skip_search_notice:
-            send_message(chat_id, t["searching"])
-        increment_request_count(chat_id)
-
-        worker = threading.Thread(
-            target=process_news_request,
-            args=(chat_id, lang, text),
-            daemon=True
-        )
-        worker.start()
+        ready_digest = get_latest_news_digest(lang, allow_stale=True)
+        if ready_digest and ready_digest.get("rendered_html"):
+            send_message(chat_id, ready_digest["rendered_html"], parse_mode="HTML")
+        else:
+            send_message(chat_id, pending_news_message(lang))
         return "ok"
 
     # 3. Обработка обычного текстового запроса (ChatGPT)

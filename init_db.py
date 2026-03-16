@@ -82,6 +82,33 @@ def init_db():
             ON news_digests (language_code, created_at DESC);
         """)
 
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS news_digest_pool (
+                id BIGSERIAL PRIMARY KEY,
+                language_code VARCHAR(10) NOT NULL,
+                source_url TEXT NOT NULL,
+                source_domain VARCHAR(255) NOT NULL,
+                title TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                country VARCHAR(255),
+                article_date_raw TEXT,
+                article_date DATE,
+                discovered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                is_active BOOLEAN NOT NULL DEFAULT FALSE
+            );
+        """)
+
+        cur.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS news_digest_pool_lang_url_uidx
+            ON news_digest_pool (language_code, source_url);
+        """)
+
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS news_digest_pool_active_idx
+            ON news_digest_pool (language_code, is_active, article_date DESC, discovered_at DESC);
+        """)
+
         conn.commit()
         cur.close()
         conn.close()
