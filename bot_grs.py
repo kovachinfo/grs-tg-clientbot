@@ -1003,6 +1003,18 @@ def build_web_search_tool(news_mode=False, include_filters=True):
     return tool
 
 
+def should_use_chat_web_search(messages):
+    if not messages:
+        return False
+
+    last_content = str(messages[-1].get("content", "")).lower()
+    temporal_markers = [
+        "сегодня", "сейчас", "актуал", "последн", "новост", "свеж",
+        "today", "current", "latest", "recent", "news", "updated",
+    ]
+    return any(marker in last_content for marker in temporal_markers)
+
+
 def get_response_models(news_mode=False):
     candidates = []
     preferred = [OPENAI_MODEL]
@@ -1015,9 +1027,11 @@ def get_response_models(news_mode=False):
     return candidates
 
 
-def get_tool_variants(news_mode=False):
+def get_tool_variants(news_mode=False, messages=None):
     if not news_mode:
-        return [("default", build_web_search_tool(news_mode=False))]
+        if should_use_chat_web_search(messages):
+            return [("default", build_web_search_tool(news_mode=False))]
+        return [("no_search", None), ("default", build_web_search_tool(news_mode=False))]
 
     if OPENAI_ENABLE_NEWS_FILTERS:
         return [
@@ -1031,16 +1045,19 @@ def get_tool_variants(news_mode=False):
 def create_response(messages, lang="ru", news_mode=False):
     last_error = None
 
-    for variant_name, web_search_tool in get_tool_variants(news_mode=news_mode):
-        allowed_domains = web_search_tool.get("filters", {}).get("allowed_domains", [])
+    for variant_name, web_search_tool in get_tool_variants(news_mode=news_mode, messages=messages):
+        allowed_domains = []
+        if web_search_tool:
+            allowed_domains = web_search_tool.get("filters", {}).get("allowed_domains", [])
 
         for model in get_response_models(news_mode=news_mode):
             try:
                 request_payload = {
                     "model": model,
                     "input": messages,
-                    "tools": [web_search_tool]
                 }
+                if web_search_tool:
+                    request_payload["tools"] = [web_search_tool]
                 msg = (
                     "OpenAI request start "
                     f"model={model} news_mode={news_mode} variant={variant_name} "
