@@ -213,6 +213,82 @@ DEFAULT_NEWS_SOURCE_PROFILES = [
         ],
         "requires_event_language": True,
     },
+    {
+        "domain": "astons.com",
+        "label": "Astons",
+        "allowed_paths": ["/ru/blog/"],
+        "section_hints": ["Блог", "ВНЖ за инвестиции", "Гражданство", "Golden Visa"],
+        "positive_keywords": [
+            "внж", "пмж", "гражданство", "золотая виза", "golden visa",
+            "инвестиции", "residence permit", "citizenship", "digital nomad",
+            "россиян", "белорусов"
+        ],
+        "negative_keywords": [
+            "услуги компании", "кейсы клиентов", "консультация", "маркетинговый материал",
+            "недвижимость без изменения программы", "налоги без миграционного эффекта"
+        ],
+        "requires_event_language": True,
+    },
+    {
+        "domain": "iworld.com",
+        "label": "iWorld",
+        "allowed_paths": ["/ru/blog/"],
+        "section_hints": ["Блог", "ВНЖ", "Гражданство за инвестиции", "Digital Nomad"],
+        "positive_keywords": [
+            "внж", "гражданство", "золотая виза", "digital nomad",
+            "residence permit", "citizenship by investment", "инвестиции",
+            "оаэ", "турция", "хорватия"
+        ],
+        "negative_keywords": [
+            "услуги компании", "кейсы клиентов", "отзывы", "реклама",
+            "общий гид без свежего изменения", "сравнение программ без новостного повода"
+        ],
+        "requires_event_language": True,
+    },
+    {
+        "domain": "migron.ru",
+        "label": "Migron",
+        "allowed_paths": ["/news/", "/articles/"],
+        "section_hints": ["Новости", "Миграционное законодательство", "Россия и СНГ"],
+        "positive_keywords": [
+            "миграцион", "внж", "рвп", "гражданство", "цифровизац",
+            "контроль", "статистика мигрантов", "закон", "мвд", "россия"
+        ],
+        "negative_keywords": [
+            "общий справочник", "услуги компании", "реклама", "трудоустройство без правового изменения",
+            "маркетинговый материал"
+        ],
+        "requires_event_language": True,
+    },
+    {
+        "domain": "passportivity.com",
+        "label": "Passportivity",
+        "allowed_paths": ["/ru/"],
+        "section_hints": ["Гражданство", "ВНЖ за инвестиции", "Digital Nomad"],
+        "positive_keywords": [
+            "гражданство", "внж", "золотая виза", "паспорт", "инвестиции",
+            "digital nomad", "citizenship", "residence permit", "россиян"
+        ],
+        "negative_keywords": [
+            "общий гид", "маркетинговый материал", "услуги компании", "реклама",
+            "сравнение без новостного события"
+        ],
+        "requires_event_language": True,
+    },
+    {
+        "domain": "visa-digital-nomad.com",
+        "label": "Visa Digital Nomad",
+        "allowed_paths": ["/ru/"],
+        "section_hints": ["Digital Nomad Visa", "Ежемесячные дайджесты", "Изменения программ"],
+        "positive_keywords": [
+            "digital nomad", "цифровой кочевник", "виза", "внж",
+            "ежемесячный дайджест", "изменения программы", "испания", "казахстан"
+        ],
+        "negative_keywords": [
+            "общий гайд без изменений", "реклама", "услуги компании", "маркетинговый материал"
+        ],
+        "requires_event_language": True,
+    },
 ]
 
 GLOBAL_NEWS_POSITIVE_KEYWORDS = [
