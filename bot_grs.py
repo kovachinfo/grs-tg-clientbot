@@ -502,6 +502,9 @@ def build_news_prompt(lang, compact=False):
         "Do not write 'Summary', 'Why it matters', 'Note', or 'limited source pool'. "
         "Do not put the year on a separate line and do not break the date. "
         "If fewer than 10 relevant items exist, return fewer, but first try to collect 10."
+    )
+
+
 def build_news_snapshot_prompt(lang):
     today = datetime.now(timezone.utc).date()
     start_date = today - timedelta(days=NEWS_LOOKBACK_DAYS)
