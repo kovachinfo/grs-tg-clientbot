@@ -65,6 +65,8 @@ processed_updates = {}
 processed_updates_lock = threading.Lock()
 active_news_jobs = set()
 active_news_jobs_lock = threading.Lock()
+active_chat_jobs = set()
+active_chat_jobs_lock = threading.Lock()
 
 
 def get_int_env(name, default):
@@ -1819,6 +1821,38 @@ def make_news_job_key(chat_id, lang):
     return f"{chat_id}:{lang}"
 
 
+def make_chat_job_key(chat_id):
+    return str(chat_id)
+
+
+def process_chat_request(chat_id, lang, user_text):
+    job_key = make_chat_job_key(chat_id)
+    stop_event = threading.Event()
+    typing_thread = threading.Thread(
+        target=run_typing,
+        args=(chat_id, stop_event),
+        daemon=True
+    )
+    typing_thread.start()
+
+    try:
+        try:
+            increment_request_count(chat_id)
+            save_message(chat_id, "user", user_text)
+            ans = generate_answer(chat_id, user_text, lang)
+            if not ans:
+                ans = TEXTS[lang]["error"]
+            save_message(chat_id, "assistant", ans)
+            send_message(chat_id, ans)
+        except Exception:
+            logger.exception("Unhandled error in process_chat_request chat_id=%s lang=%s", chat_id, lang)
+            send_message(chat_id, TEXTS[lang]["error"])
+    finally:
+        stop_event.set()
+        with active_chat_jobs_lock:
+            active_chat_jobs.discard(job_key)
+
+
 def process_news_request(chat_id, lang, trigger_text):
     job_key = make_news_job_key(chat_id, lang)
     stop_event = threading.Event()
@@ -2014,13 +2048,20 @@ def webhook():
         send_message(chat_id, format_limit_reached_message(lang))
         return "ok"
 
-    increment_request_count(chat_id)
-    save_message(chat_id, "user", text)
-    
-    # Можно отправить "печатает..." или уведомление
-    ans = generate_answer(chat_id, text, lang)
-    save_message(chat_id, "assistant", ans)
-    send_message(chat_id, ans)
+    chat_job_key = make_chat_job_key(chat_id)
+    with active_chat_jobs_lock:
+        if chat_job_key in active_chat_jobs:
+            logger.info("Chat job already active for %s", chat_job_key)
+            print(f"Chat job already active for {chat_job_key}", flush=True)
+            return "ok"
+        active_chat_jobs.add(chat_job_key)
+
+    worker = threading.Thread(
+        target=process_chat_request,
+        args=(chat_id, lang, text),
+        daemon=True
+    )
+    worker.start()
 
     return "ok"
 
