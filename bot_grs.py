@@ -1558,6 +1558,103 @@ def extract_json_array_from_text(text):
         return []
 
 
+GENERIC_DIGEST_TITLE_PREFIXES = [
+    "все, что нужно знать",
+    "всё, что нужно знать",
+    "что дает",
+    "что даёт",
+    "требования и процедура",
+    "права, возможности и ограничения",
+    "подробный гид",
+    "guide to",
+    "everything you need to know",
+    "requirements and procedure",
+]
+
+GENERIC_DIGEST_URL_SEGMENTS = {
+    "blog",
+    "residence",
+    "citizenship-and-residence",
+    "program-comparison",
+    "residence-permit-for-financial-independent",
+    "citizenship",
+    "residence-permit",
+}
+
+
+def cleanup_digest_text(value):
+    if not value:
+        return ""
+
+    text = sanitize_plain_text(str(value), preserve_urls=True)
+    text = re.sub(r"\b(\d{4})\s*[–-]\s*ы\b", r"\1", text, flags=re.I)
+    text = re.sub(r"\b(\d{4})\s*[–-](?!\d)", r"\1", text)
+    text = re.sub(r"\b(\d{4})\s*[–-]\s*\.", r"\1.", text)
+    text = re.sub(r"\s{2,}", " ", text).strip(" \n\t-—,;.")
+
+    if text and text[0].islower():
+        text = text[0].upper() + text[1:]
+
+    return text
+
+
+def is_generic_digest_source_url(source_url):
+    if not source_url:
+        return True
+
+    try:
+        parsed = urlparse(source_url)
+    except Exception:
+        return True
+
+    if not parsed.scheme or not parsed.netloc:
+        return True
+
+    path = (parsed.path or "").strip("/")
+    if not path:
+        return True
+
+    segments = [segment.lower() for segment in path.split("/") if segment]
+    if not segments:
+        return True
+
+    if len(segments) <= 2 and segments[-1] in GENERIC_DIGEST_URL_SEGMENTS:
+        return True
+
+    return False
+
+
+def looks_like_evergreen_digest_item(title, summary):
+    title_lower = (title or "").lower()
+    summary_lower = (summary or "").lower()
+
+    generic_markers = [
+        "все, что нужно знать",
+        "всё, что нужно знать",
+        "что дает",
+        "что даёт",
+        "требования и процедура",
+        "права, возможности и ограничения",
+        "подробный гид",
+        "инвестору",
+        "guide",
+        "everything you need to know",
+        "requirements and procedure",
+        "rights, opportunities and limitations",
+        "for investors",
+        "process and requirements",
+    ]
+
+    if any(title_lower.startswith(prefix) for prefix in GENERIC_DIGEST_TITLE_PREFIXES):
+        return True
+    if any(marker in title_lower for marker in generic_markers) and "измен" not in title_lower:
+        return True
+    if any(marker in summary_lower for marker in ["подробный гид", "guide", "возможности получения", "что нужно знать инвестору"]):
+        return True
+
+    return False
+
+
 def normalize_digest_item(item):
     if not isinstance(item, dict):
         return None
@@ -1587,6 +1684,15 @@ def normalize_digest_item(item):
     title = re.sub(r"^[A-Za-zА-Яа-яЁё0-9/ —-]{2,40}:\s+", "", title).strip()
     date = re.sub(relative_date_pattern, "", date, flags=re.I).strip(" \n\t-—,;.")
 
+    title = cleanup_digest_text(title)
+    date = cleanup_digest_text(date)
+    title_needs_country_context = bool(
+        title and (
+            title[0].islower()
+            or any(title.lower().startswith(prefix) for prefix in GENERIC_DIGEST_TITLE_PREFIXES)
+        )
+    )
+
     if not country:
         country = extract_news_item_country(f"{title}") or ""
     if not country:
@@ -1595,13 +1701,24 @@ def normalize_digest_item(item):
     summary = sanitize_plain_text(summary, preserve_urls=True)
     summary = re.sub(r"\s{2,}", " ", summary).strip(" \n\t-—,;.")
     summary = re.sub(relative_date_pattern, "", summary, flags=re.I).strip(" \n\t-—,;.")
+    summary = cleanup_digest_text(summary)
     sentences = [sentence.strip() for sentence in re.split(r"(?<=[.!?])\s+", summary) if sentence.strip()]
     if len(sentences) > 3:
         summary = " ".join(sentences[:3]).strip()
-    if len(summary) < 90 or not source_url:
+
+    if not source_url or is_generic_digest_source_url(source_url):
+        return None
+    if looks_like_evergreen_digest_item(title, summary):
+        return None
+    if len(summary) < 90:
         return None
 
     article_date = parse_article_date(date)
+
+    if title and title[0].islower():
+        title = title[0].upper() + title[1:]
+    if title and country and title_needs_country_context:
+        title = f"{country}: {title}"
 
     return {
         "country": country,
