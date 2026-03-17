@@ -1844,30 +1844,20 @@ def refresh_news_digest(lang="ru", force=False, chat_id=None):
             "updated": False,
         }
 
-    existing_active_rows = get_news_pool_rows(lang, active_only=True)
-    existing_active_items = [row_to_digest_item(row) for row in existing_active_rows]
-    existing_active_urls = {item["source_url"] for item in existing_active_items if item.get("source_url")}
+    existing_pool_rows = get_news_pool_rows(lang, active_only=False)
+    existing_pool_items = [row_to_digest_item(row) for row in existing_pool_rows]
+    existing_pool_urls = {item["source_url"] for item in existing_pool_items if item.get("source_url")}
 
     digest = build_news_digest(chat_id or 0, lang)
     candidate_items = digest["items"]
-    new_candidate_items = [item for item in candidate_items if item.get("source_url") not in existing_active_urls]
+    new_candidate_items = [item for item in candidate_items if item.get("source_url") not in existing_pool_urls]
 
     for item in candidate_items:
         upsert_news_pool_item(lang, item)
 
-    if not new_candidate_items and existing_active_items:
-        final_items = dedupe_digest_items(existing_active_items)
-        quality = evaluate_digest_quality(final_items)
-        return {
-            "status": "unchanged",
-            "updated": False,
-            "new_count": 0,
-            "item_count": quality["item_count"],
-            "domains": quality["domains"],
-            "urls": quality["urls"],
-        }
-
-    final_items = merge_news_pool_items(existing_active_items, new_candidate_items)
+    refreshed_pool_rows = get_news_pool_rows(lang, active_only=False)
+    refreshed_pool_items = [row_to_digest_item(row) for row in refreshed_pool_rows]
+    final_items = merge_news_pool_items(refreshed_pool_items, [])
     quality = evaluate_digest_quality(final_items)
 
     if is_digest_ready(final_items):
@@ -1889,6 +1879,16 @@ def refresh_news_digest(lang="ru", force=False, chat_id=None):
             "updated": bool(new_candidate_items),
             "new_count": len(new_candidate_items),
             "item_count": len(final_items),
+            "domains": quality["domains"],
+            "urls": quality["urls"],
+        }
+
+    if not new_candidate_items and refreshed_pool_items:
+        return {
+            "status": "unchanged",
+            "updated": False,
+            "new_count": 0,
+            "item_count": quality["item_count"],
             "domains": quality["domains"],
             "urls": quality["urls"],
         }
