@@ -1858,6 +1858,24 @@ def row_to_digest_item(row):
     }
 
 
+def get_active_news_digest(lang):
+    try:
+        rows = get_news_pool_rows(lang, active_only=True)
+        items = [row_to_digest_item(row) for row in rows]
+        if not items:
+            return None
+
+        rendered_html = render_news_digest_html(items, lang)
+        return {
+            "items_json": items,
+            "rendered_html": rendered_html,
+            "item_count": len(items),
+        }
+    except Exception as e:
+        logger.error(f"Error building active news digest: {e}")
+        return None
+
+
 def merge_news_pool_items(existing_active_items, new_candidate_items):
     if not new_candidate_items:
         return dedupe_digest_items(existing_active_items)
@@ -2516,6 +2534,11 @@ def webhook():
         return "ok"
 
     if text in [ru_t["btn_news"], en_t["btn_news"]]:
+        active_digest = get_active_news_digest(lang)
+        if active_digest and active_digest.get("rendered_html"):
+            send_message(chat_id, active_digest["rendered_html"], parse_mode="HTML")
+            return "ok"
+
         ready_digest = get_latest_news_digest(lang, allow_stale=True)
         if ready_digest and ready_digest.get("rendered_html"):
             send_message(chat_id, ready_digest["rendered_html"], parse_mode="HTML")
