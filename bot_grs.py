@@ -800,6 +800,14 @@ def get_latest_news_digest(lang, allow_stale=False):
 
 
 def save_news_digest(lang, items, rendered_html, raw_response, model_used, status="ready"):
+    serializable_items = []
+    for item in items or []:
+        current = dict(item)
+        article_date = current.get("article_date")
+        if isinstance(article_date, (date, datetime)):
+            current["article_date"] = article_date.isoformat()
+        serializable_items.append(current)
+
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
@@ -815,7 +823,7 @@ def save_news_digest(lang, items, rendered_html, raw_response, model_used, statu
                     ) VALUES (%s, %s, %s, %s, %s, %s)
                     RETURNING id
                     """,
-                    (lang, status, Json(items), rendered_html, raw_response, model_used),
+                    (lang, status, Json(serializable_items), rendered_html, raw_response, model_used),
                 )
                 row = cur.fetchone()
                 conn.commit()
