@@ -777,10 +777,10 @@ def get_latest_news_digest(lang, allow_stale=False):
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT rendered_html, items_json, raw_response, model_used, created_at
+                    SELECT id, rendered_html, items_json, raw_response, model_used, created_at
                     FROM news_digests
                     WHERE language_code = %s AND status = 'ready'
-                    ORDER BY created_at DESC
+                    ORDER BY created_at DESC, id DESC
                     LIMIT 1
                     """,
                     (lang,),
@@ -813,12 +813,17 @@ def save_news_digest(lang, items, rendered_html, raw_response, model_used, statu
                         raw_response,
                         model_used
                     ) VALUES (%s, %s, %s, %s, %s, %s)
+                    RETURNING id
                     """,
                     (lang, status, Json(items), rendered_html, raw_response, model_used),
                 )
+                row = cur.fetchone()
                 conn.commit()
+                return row["id"] if row else None
     except Exception as e:
         logger.error(f"Error saving news digest: {e}")
+        print(f"Error saving news digest: {e}", flush=True)
+        return None
 
 
 def clear_news_digest(lang=None):
@@ -1866,7 +1871,7 @@ def refresh_news_digest(lang="ru", force=False, chat_id=None):
             [item["source_url"] for item in final_items if item.get("source_url")],
         )
         rendered_html = render_news_digest_html(final_items, lang)
-        save_news_digest(
+        digest_id = save_news_digest(
             lang,
             final_items,
             rendered_html,
@@ -1874,6 +1879,16 @@ def refresh_news_digest(lang="ru", force=False, chat_id=None):
             digest["model_used"],
             status="ready",
         )
+        if not digest_id:
+            return {
+                "status": "failed",
+                "updated": False,
+                "new_count": len(new_candidate_items),
+                "item_count": len(final_items),
+                "domains": quality["domains"],
+                "urls": quality["urls"],
+                "reason": "save_ready_digest_failed",
+            }
         return {
             "status": "ready",
             "updated": bool(new_candidate_items),
@@ -1881,6 +1896,7 @@ def refresh_news_digest(lang="ru", force=False, chat_id=None):
             "item_count": len(final_items),
             "domains": quality["domains"],
             "urls": quality["urls"],
+            "digest_id": digest_id,
         }
 
     if not new_candidate_items and refreshed_pool_items:
@@ -1893,7 +1909,7 @@ def refresh_news_digest(lang="ru", force=False, chat_id=None):
             "urls": quality["urls"],
         }
 
-    save_news_digest(
+    digest_id = save_news_digest(
         lang,
         final_items or candidate_items,
         render_news_digest_html(final_items or candidate_items, lang) if (final_items or candidate_items) else "",
@@ -1908,6 +1924,7 @@ def refresh_news_digest(lang="ru", force=False, chat_id=None):
         "item_count": quality["item_count"],
         "domains": quality["domains"],
         "urls": quality["urls"],
+        "digest_id": digest_id,
     }
 
 
