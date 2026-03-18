@@ -1843,25 +1843,29 @@ def row_to_digest_item(row):
     article_date = row.get("article_date")
     if article_date and isinstance(article_date, datetime):
         article_date = article_date.date()
-    return {
-        "id": row.get("id"),
+    normalized = normalize_digest_item({
         "country": row.get("country") or "",
         "title": row.get("title") or "",
         "date": row.get("article_date_raw") or "",
         "summary": row.get("summary") or "",
         "source_domain": row.get("source_domain") or "",
         "source_url": row.get("source_url") or "",
-        "article_date": article_date if isinstance(article_date, date) else None,
-        "normalized_title_key": normalize_news_item_key(
-            f"{row.get('source_domain', '')} {row.get('title', '')}"
-        ),
-    }
+    })
+    if not normalized:
+        return None
+
+    normalized["id"] = row.get("id")
+    if isinstance(article_date, date):
+        normalized["article_date"] = article_date
+    return normalized
 
 
 def get_active_news_digest(lang):
     try:
         rows = get_news_pool_rows(lang, active_only=True)
         items = [row_to_digest_item(row) for row in rows]
+        items = [item for item in items if item]
+        items = dedupe_digest_items(items)
         if not items:
             return None
 
@@ -1994,6 +1998,7 @@ def refresh_news_digest(lang="ru", force=False, chat_id=None):
 
     existing_pool_rows = get_news_pool_rows(lang, active_only=False)
     existing_pool_items = [row_to_digest_item(row) for row in existing_pool_rows]
+    existing_pool_items = [item for item in existing_pool_items if item]
     existing_pool_urls = {item["source_url"] for item in existing_pool_items if item.get("source_url")}
 
     digest = build_news_digest(chat_id or 0, lang)
@@ -2005,6 +2010,7 @@ def refresh_news_digest(lang="ru", force=False, chat_id=None):
 
     refreshed_pool_rows = get_news_pool_rows(lang, active_only=False)
     refreshed_pool_items = [row_to_digest_item(row) for row in refreshed_pool_rows]
+    refreshed_pool_items = [item for item in refreshed_pool_items if item]
     final_items = merge_news_pool_items(refreshed_pool_items, [])
     quality = evaluate_digest_quality(final_items)
 
