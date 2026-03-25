@@ -1,3 +1,6 @@
 __pycache__/
 .env
 docs/n8n_workflow.json
+telegram_bot_architecture_2.png
+telegram_bot_architecture.pdf
+telegram_bot_architecture.png
