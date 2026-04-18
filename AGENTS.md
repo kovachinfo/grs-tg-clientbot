@@ -33,6 +33,7 @@ News digest generation is no longer done per-user on button press.
 
 Current architecture:
 - external scheduler: `n8n`
+- current scheduler host: `https://n8n.kovach.info`
 - protected endpoint: `GET/POST /tasks/refresh-news-digest`
 - auth: `X-News-Cron-Token` header or `token` query parameter
 - language parameter: `lang=ru` or `lang=en`
@@ -157,9 +158,15 @@ The bot sends:
 
 Expected setup:
 - `Schedule Trigger`
+- cadence: weekly
 - `HTTP Request`
 - `GET https://<domain>/tasks/refresh-news-digest?lang=ru`
 - header: `X-News-Cron-Token`
+
+Current deployment note:
+- the `n8n` backend is hosted on `n8n.kovach.info`
+- digest refresh is triggered weekly from that server
+- no Railway native cron is used in the current production setup
 
 The scheduler is external because Railway native cron was not used as the primary mechanism in this project state.
 
