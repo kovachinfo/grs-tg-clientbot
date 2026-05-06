@@ -612,6 +612,7 @@ def build_news_snapshot_prompt(lang):
             "summary: информативное описание в 2-3 предложениях, примерно в 2 раза подробнее короткой заметки. "
             "date: точная дата публикации или изменения, строкой, без формулировок вроде '3 месяца назад'. "
             "source_url: полный URL оригинальной статьи. "
+            "Не добавляй URL или домен источника в title и summary; для этого есть source_domain и source_url. "
             "Не используй homepage, category page, evergreen guide или маркетинговую страницу, если нет конкретного свежего изменения. "
             "Короткий список допустимых источников и разделов:\n"
             + f"{source_profiles}"
@@ -636,6 +637,7 @@ def build_news_snapshot_prompt(lang):
         "summary: informative 2-3 sentence description, about twice as detailed as a short brief. "
         "date: exact publication or change date as a string, without relative dates like '3 months ago'. "
         "source_url: full original article URL. "
+        "Do not include URLs or source domains in title or summary; use source_domain and source_url only. "
         "Do not use site homepages, category pages, evergreen guides, or marketing pages unless they clearly contain a fresh policy change. "
         "Allowed source list and sections:\n"
         + f"{source_profiles}"
@@ -1598,6 +1600,38 @@ def cleanup_digest_text(value):
     return text
 
 
+def strip_digest_source_artifacts(value, source_domain="", source_url=""):
+    if not value:
+        return ""
+
+    text = str(value)
+    source_domain = normalize_host(source_domain or "")
+    source_host = normalize_host(source_url or "")
+    domains = {domain for domain in [source_domain, source_host] if domain}
+
+    text = re.sub(r"\s*\([^)]*https?://[^)]*\)", "", text, flags=re.I)
+    text = re.sub(r"\s*\[[^\]]*https?://[^\]]*\]", "", text, flags=re.I)
+    text = re.sub(r"\s*[—-]\s*https?://\S+", "", text, flags=re.I)
+    text = re.sub(r"https?://\S+", "", text, flags=re.I)
+
+    for domain in domains:
+        escaped_domain = re.escape(domain)
+        text = re.sub(
+            rf"\s*\([^)]*\b{escaped_domain}\b[^)]*\)",
+            "",
+            text,
+            flags=re.I,
+        )
+        text = re.sub(
+            rf"\s*[—-]\s*\b{escaped_domain}\b",
+            "",
+            text,
+            flags=re.I,
+        )
+
+    return re.sub(r"\s{2,}", " ", text).strip(" \n\t-—,;.")
+
+
 def is_generic_digest_source_url(source_url):
     if not source_url:
         return True
@@ -1683,6 +1717,8 @@ def normalize_digest_item(item):
     title = re.sub(relative_date_pattern, "", title, flags=re.I).strip(" \n\t-—,;.")
     title = re.sub(r"^[A-Za-zА-Яа-яЁё0-9/ —-]{2,40}:\s+", "", title).strip()
     date = re.sub(relative_date_pattern, "", date, flags=re.I).strip(" \n\t-—,;.")
+    title = strip_digest_source_artifacts(title, source_domain, source_url)
+    summary = strip_digest_source_artifacts(summary, source_domain, source_url)
 
     title = cleanup_digest_text(title)
     date = cleanup_digest_text(date)
@@ -1699,6 +1735,7 @@ def normalize_digest_item(item):
         country = "Страна" if re.search(r"[А-Яа-яЁё]", title) else "Country"
 
     summary = sanitize_plain_text(summary, preserve_urls=True)
+    summary = strip_digest_source_artifacts(summary, source_domain, source_url)
     summary = re.sub(r"\s{2,}", " ", summary).strip(" \n\t-—,;.")
     summary = re.sub(relative_date_pattern, "", summary, flags=re.I).strip(" \n\t-—,;.")
     summary = cleanup_digest_text(summary)
@@ -1904,36 +1941,60 @@ def render_news_digest_html(items, lang):
     )
 
     formatted = []
-    source_label = "Оригинал статьи" if lang == "ru" else "Original article"
+    source_label = "Оригинал" if lang == "ru" else "Original"
 
     for index, item in enumerate(items, start=1):
         title = escape_html(item.get("title", "").strip())
         date = escape_html(item.get("date", "").strip())
         summary = escape_html(item.get("summary", "").strip())
-        lead = f"{index}) {title}"
-        if summary:
-            lead += f". {summary}"
+        title_line = f"🗞️ <b>{index}. {title}</b>"
 
         domain = escape_html(item.get("source_domain", "").strip())
         url = item.get("source_url", "").strip()
 
         if url and domain:
-            source_line = f"{source_label}: <a href=\"{escape_html_attr(url)}\">{domain}</a>"
+            source_line = f"🔗 {source_label}: <a href=\"{escape_html_attr(url)}\">{domain}</a>"
         elif url:
-            source_line = f"{source_label}: <a href=\"{escape_html_attr(url)}\">{escape_html(url)}</a>"
+            source_line = (
+                f"🔗 {source_label}: "
+                f"<a href=\"{escape_html_attr(url)}\">{escape_html(url)}</a>"
+            )
         elif domain:
-            source_line = f"{source_label}: {domain}"
+            source_line = f"🔗 {source_label}: {domain}"
         else:
             source_line = ""
 
-        block_lines = [lead]
+        block_lines = [title_line]
+        if summary:
+            block_lines.append(summary)
         if source_line:
             block_lines.append(source_line)
         if date:
-            block_lines.append(date)
+            block_lines.append(f"📅 {date}")
         formatted.append("\n".join(block_lines).strip())
 
     return f"{escape_html(header)}\n\n" + "\n\n".join(formatted)
+
+
+def render_news_digest_snapshot(row, lang):
+    if not row:
+        return ""
+
+    items = row.get("items_json") or []
+    if isinstance(items, str):
+        try:
+            items = json.loads(items)
+        except json.JSONDecodeError:
+            items = []
+
+    if isinstance(items, list):
+        normalized_items = [normalize_digest_item(item) for item in items]
+        normalized_items = [item for item in normalized_items if item]
+        normalized_items = dedupe_digest_items(normalized_items)
+        if normalized_items:
+            return render_news_digest_html(normalized_items, lang)
+
+    return row.get("rendered_html") or ""
 
 
 def build_news_digest(chat_id, lang):
@@ -2192,18 +2253,12 @@ def format_news_html(text, lang):
     return f"{escape_html(header)}\n\n{body}".strip()
 
 
-def split_message_chunks(text, limit=TELEGRAM_MAX_MESSAGE_LEN):
-    if not text:
-        return [""]
-
-    if len(text) <= limit:
-        return [text]
-
+def split_long_message_block(block, limit):
     chunks = []
     current = []
     current_len = 0
 
-    for line in text.splitlines(keepends=True):
+    for line in block.splitlines(keepends=True):
         line_len = len(line)
         if line_len > limit:
             if current:
@@ -2231,6 +2286,41 @@ def split_message_chunks(text, limit=TELEGRAM_MAX_MESSAGE_LEN):
         chunks.append("".join(current).rstrip())
 
     return chunks
+
+
+def split_message_chunks(text, limit=TELEGRAM_MAX_MESSAGE_LEN):
+    if not text:
+        return [""]
+
+    if len(text) <= limit:
+        return [text]
+
+    chunks = []
+    current = ""
+
+    for block in text.split("\n\n"):
+        block = block.strip()
+        if not block:
+            continue
+
+        if len(block) > limit:
+            if current:
+                chunks.append(current.rstrip())
+                current = ""
+            chunks.extend(split_long_message_block(block, limit))
+            continue
+
+        candidate = f"{current}\n\n{block}" if current else block
+        if len(candidate) > limit:
+            chunks.append(current.rstrip())
+            current = block
+        else:
+            current = candidate
+
+    if current:
+        chunks.append(current.rstrip())
+
+    return chunks or [""]
 
 # ---------------------------------------------
 # Генерация ответа (Responses API + web_search)
@@ -2332,7 +2422,7 @@ def generate_answer(chat_id, user_message, lang="ru", use_history=True, news_mod
 # ---------------------------------------------
 # Отправка сообщений (с клавиатурой)
 # ---------------------------------------------
-def send_message(chat_id, text, keyboard=None, parse_mode=None):
+def send_message(chat_id, text, keyboard=None, parse_mode=None, disable_web_page_preview=False):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         chunks = split_message_chunks(text)
@@ -2344,6 +2434,8 @@ def send_message(chat_id, text, keyboard=None, parse_mode=None):
                 payload["reply_markup"] = keyboard
             if parse_mode:
                 payload["parse_mode"] = parse_mode
+            if disable_web_page_preview:
+                payload["disable_web_page_preview"] = True
 
             resp = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT_SEC)
             if not resp.ok:
@@ -2542,12 +2634,23 @@ def webhook():
     if text in [ru_t["btn_news"], en_t["btn_news"]]:
         active_digest = get_active_news_digest(lang)
         if active_digest and active_digest.get("rendered_html"):
-            send_message(chat_id, active_digest["rendered_html"], parse_mode="HTML")
+            send_message(
+                chat_id,
+                active_digest["rendered_html"],
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
             return "ok"
 
         ready_digest = get_latest_news_digest(lang, allow_stale=True)
-        if ready_digest and ready_digest.get("rendered_html"):
-            send_message(chat_id, ready_digest["rendered_html"], parse_mode="HTML")
+        ready_digest_html = render_news_digest_snapshot(ready_digest, lang)
+        if ready_digest_html:
+            send_message(
+                chat_id,
+                ready_digest_html,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
         else:
             send_message(chat_id, pending_news_message(lang))
         return "ok"
