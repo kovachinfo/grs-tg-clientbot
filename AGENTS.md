@@ -175,9 +175,12 @@ Important env vars currently used by the app:
 - `TELEGRAM_TOKEN`
 - `TELEGRAM_WEBHOOK_SECRET`
 - `OPENAI_API_KEY`
+- `OPENAI_BASE_URL`
 - `OPENAI_MODEL`
 - `OPENAI_NEWS_MODEL`
+- `OPENAI_TRANSLATION_MODEL`
 - `OPENAI_FALLBACK_MODELS`
+- `OPENAI_TRANSLATION_FALLBACK_MODELS`
 - `OPENAI_TIMEOUT_SEC`
 - `DATABASE_URL`
 - `MANAGER_USERNAME`
@@ -191,6 +194,8 @@ Important env vars currently used by the app:
 Notes:
 - `OPENAI_MODEL` is the default chat model
 - `OPENAI_NEWS_MODEL` is the preferred model for digest building
+- `OPENAI_TRANSLATION_MODEL` is the low-cost model for translating digest items into the digest language
+- `OPENAI_BASE_URL` can point the OpenAI SDK to an OpenAI-compatible provider or aggregator
 - `NEWS_CRON_TOKEN` protects the refresh endpoint
 - `NEWS_ADMIN_CHAT_ID` controls who can use `/refresh_news`
 

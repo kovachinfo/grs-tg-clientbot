@@ -35,11 +35,17 @@ app = Flask(__name__)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_BASE_URL = (os.getenv("OPENAI_BASE_URL") or "").strip()
+# Model settings are env-driven because provider/model availability can change.
 OPENAI_MODEL = (os.getenv("OPENAI_MODEL") or "gpt-5-mini").strip()
 OPENAI_NEWS_MODEL = (os.getenv("OPENAI_NEWS_MODEL") or "gpt-4.1").strip()
+OPENAI_TRANSLATION_MODEL = (os.getenv("OPENAI_TRANSLATION_MODEL") or "gpt-4.1-nano").strip()
 OPENAI_ENABLE_NEWS_FILTERS = os.getenv("OPENAI_ENABLE_NEWS_FILTERS", "false").lower() == "true"
 MANAGER_USERNAME = os.getenv("MANAGER_USERNAME", "globalrelocationsolutions_cz").lstrip("@")
 OPENAI_FALLBACK_MODELS_RAW = os.getenv("OPENAI_FALLBACK_MODELS") or "gpt-5,gpt-4.1,gpt-4o"
+OPENAI_TRANSLATION_FALLBACK_MODELS_RAW = (
+    os.getenv("OPENAI_TRANSLATION_FALLBACK_MODELS") or "gpt-4o-mini,gpt-4.1-mini"
+)
 NEWS_CRON_TOKEN = os.getenv("NEWS_CRON_TOKEN", "")
 NEWS_ADMIN_CHAT_ID = int(os.getenv("NEWS_ADMIN_CHAT_ID", "1111827435"))
 
@@ -48,7 +54,10 @@ try:
 except ValueError:
     OPENAI_TIMEOUT_SEC = 45.0
 
-client = OpenAI(api_key=OPENAI_API_KEY, timeout=OPENAI_TIMEOUT_SEC)
+openai_client_kwargs = {"api_key": OPENAI_API_KEY, "timeout": OPENAI_TIMEOUT_SEC}
+if OPENAI_BASE_URL:
+    openai_client_kwargs["base_url"] = OPENAI_BASE_URL
+client = OpenAI(**openai_client_kwargs)
 
 # ---------------------------------------------
 # Тексты и настройки
@@ -327,9 +336,12 @@ def format_limit_reached_message(lang):
 print(
     "Startup config "
     f"openai_sdk={get_package_version('openai')} "
+    f"openai_base_url={'custom' if OPENAI_BASE_URL else 'default'} "
     f"openai_model={OPENAI_MODEL} "
     f"openai_news_model={OPENAI_NEWS_MODEL or '<empty>'} "
+    f"openai_translation_model={OPENAI_TRANSLATION_MODEL or '<empty>'} "
     f"openai_fallback_models={OPENAI_FALLBACK_MODELS_RAW} "
+    f"openai_translation_fallback_models={OPENAI_TRANSLATION_FALLBACK_MODELS_RAW} "
     f"news_lookback_days={NEWS_LOOKBACK_DAYS} "
     f"openai_timeout_sec={OPENAI_TIMEOUT_SEC} "
     f"news_filters_enabled={OPENAI_ENABLE_NEWS_FILTERS}",
@@ -379,6 +391,15 @@ def parse_config_list(raw_value):
 
 def get_fallback_models():
     return parse_config_list(OPENAI_FALLBACK_MODELS_RAW)
+
+
+def get_translation_models():
+    candidates = []
+    fallback_models = parse_config_list(OPENAI_TRANSLATION_FALLBACK_MODELS_RAW)
+    for model in [OPENAI_TRANSLATION_MODEL] + fallback_models:
+        if model and model not in candidates:
+            candidates.append(model)
+    return candidates
 
 
 def cleanup_processed_updates(now_ts=None):
@@ -609,10 +630,13 @@ def build_news_snapshot_prompt(lang):
             + "Если точной статьи нет, не придумывай ее. Нужна только оригинальная статья, а не главная страница сайта. "
             "Верни ТОЛЬКО JSON-массив объектов без markdown и без пояснений. "
             "Поля каждого объекта: country, title, date, summary, source_domain, source_url. "
+            "Все поля country, title, date и summary должны быть на русском; "
+            "переводи материалы иностранных источников. "
             "summary: информативное описание в 2-3 предложениях, примерно в 2 раза подробнее короткой заметки. "
             "date: точная дата публикации или изменения, строкой, без формулировок вроде '3 месяца назад'. "
             "source_url: полный URL оригинальной статьи. "
-            "Не добавляй URL или домен источника в title и summary; для этого есть source_domain и source_url. "
+            "Не добавляй URL или домен источника в title и summary; "
+            "для этого есть source_domain и source_url. "
             "Не используй homepage, category page, evergreen guide или маркетинговую страницу, если нет конкретного свежего изменения. "
             "Короткий список допустимых источников и разделов:\n"
             + f"{source_profiles}"
@@ -634,10 +658,13 @@ def build_news_snapshot_prompt(lang):
         + "If there is no exact article, do not invent it. Only original article URLs, not site homepages. "
         "Return ONLY a JSON array of objects, no markdown and no explanations. "
         "Fields for each object: country, title, date, summary, source_domain, source_url. "
+        "All country, title, date, and summary fields must be in English; "
+        "translate foreign-language source material. "
         "summary: informative 2-3 sentence description, about twice as detailed as a short brief. "
         "date: exact publication or change date as a string, without relative dates like '3 months ago'. "
         "source_url: full original article URL. "
-        "Do not include URLs or source domains in title or summary; use source_domain and source_url only. "
+        "Do not include URLs or source domains in title or summary; "
+        "use source_domain and source_url only. "
         "Do not use site homepages, category pages, evergreen guides, or marketing pages unless they clearly contain a fresh policy change. "
         "Allowed source list and sections:\n"
         + f"{source_profiles}"
@@ -1769,6 +1796,136 @@ def normalize_digest_item(item):
     }
 
 
+def digest_text_language_counts(item):
+    text = " ".join(
+        str(item.get(field, "") or "")
+        for field in ["country", "title", "date", "summary"]
+    )
+    return {
+        "cyrillic": len(re.findall(r"[А-Яа-яЁё]", text)),
+        "latin": len(re.findall(r"[A-Za-z]", text)),
+    }
+
+
+def needs_digest_item_translation(item, lang):
+    counts = digest_text_language_counts(item)
+    cyrillic_count = counts["cyrillic"]
+    latin_count = counts["latin"]
+
+    if lang == "ru":
+        return latin_count >= 24 and cyrillic_count < max(12, latin_count // 3)
+    if lang == "en":
+        return cyrillic_count >= 24 and latin_count < max(12, cyrillic_count // 3)
+    return False
+
+
+def apply_digest_item_translation(item, translated):
+    current = dict(item)
+    for field in ["country", "title", "date", "summary"]:
+        value = translated.get(field)
+        if value:
+            value = strip_digest_source_artifacts(
+                cleanup_digest_text(value),
+                current.get("source_domain", ""),
+                current.get("source_url", ""),
+            )
+            if value:
+                current[field] = value
+
+    normalized = normalize_digest_item(current)
+    return normalized or current
+
+
+def translate_digest_items(items, lang):
+    targets = [
+        {
+            "index": index,
+            **{
+                field: item.get(field, "")
+                for field in ["country", "title", "date", "summary"]
+            },
+        }
+        for index, item in enumerate(items)
+        if needs_digest_item_translation(item, lang)
+    ]
+    if not targets:
+        return items
+
+    target_language = "Russian" if lang == "ru" else "English"
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You translate migration digest items. "
+                "Return only a valid JSON array, no markdown. "
+                "Preserve meaning, dates, proper nouns, legal terms, and article scope. "
+                "Do not add facts. Do not include source URLs or domains in translated fields."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "target_language": target_language,
+                    "items": targets,
+                    "required_output_fields": ["index", "country", "title", "date", "summary"],
+                },
+                ensure_ascii=False,
+            ),
+        },
+    ]
+
+    last_error = None
+    for model in get_translation_models():
+        try:
+            logger.info(
+                "OpenAI translation request start model=%s lang=%s items=%s",
+                model,
+                lang,
+                len(targets),
+            )
+            response = client.responses.create(model=model, input=messages)
+            translated_items = extract_json_array_from_text((response.output_text or "").strip())
+            translated_by_index = {}
+            for translated in translated_items:
+                if not isinstance(translated, dict):
+                    continue
+                index = translated.get("index")
+                if isinstance(index, int):
+                    translated_by_index[index] = translated
+
+            if not translated_by_index:
+                raise ValueError("translation response did not contain indexed items")
+
+            updated_items = [dict(item) for item in items]
+            for index, translated in translated_by_index.items():
+                if 0 <= index < len(updated_items):
+                    updated_items[index] = apply_digest_item_translation(
+                        updated_items[index],
+                        translated,
+                    )
+
+            logger.info(
+                "OpenAI translation completed model=%s lang=%s translated_items=%s",
+                model,
+                lang,
+                len(translated_by_index),
+            )
+            return updated_items
+        except Exception as exc:
+            last_error = exc
+            logger.exception(
+                "OpenAI translation failed model=%s lang=%s exc_type=%s err=%s",
+                model,
+                lang,
+                exc.__class__.__name__,
+                exc,
+            )
+
+    logger.error("OpenAI translation skipped after failures lang=%s err=%s", lang, last_error)
+    return items
+
+
 def enrich_digest_items_with_citations(items, response):
     citations = collect_response_citations(response)
     if not citations:
@@ -2031,6 +2188,7 @@ def build_news_digest(chat_id, lang):
         items = [normalize_digest_item(item) for item in extract_json_array_from_text(raw_text)]
         items = [item for item in items if item]
         items = enrich_digest_items_with_citations(items, response)
+        items = translate_digest_items(items, lang)
         items = dedupe_digest_items(items)
 
         candidate = {
