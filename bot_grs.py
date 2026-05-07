@@ -1819,6 +1819,10 @@ def needs_digest_item_translation(item, lang):
     return False
 
 
+def count_digest_language_mismatches(items, lang):
+    return sum(1 for item in items if needs_digest_item_translation(item, lang))
+
+
 def apply_digest_item_translation(item, translated):
     current = dict(item)
     for field in ["country", "title", "date", "summary"]:
@@ -1996,9 +2000,10 @@ def dedupe_digest_items(items):
     return deduped[:TARGET_NEWS_ITEMS]
 
 
-def evaluate_digest_quality(items):
+def evaluate_digest_quality(items, lang="ru"):
     domains = {item.get("source_domain") for item in items if item.get("source_domain")}
     urls = sum(1 for item in items if item.get("source_url"))
+    language_mismatches = count_digest_language_mismatches(items, lang)
     domain_limit_ok = all(
         sum(1 for item in items if item.get("source_domain") == domain) <= MAX_NEWS_PER_DOMAIN
         for domain in domains
@@ -2017,17 +2022,19 @@ def evaluate_digest_quality(items):
         "item_count": len(items),
         "domains": len(domains),
         "urls": urls,
+        "language_mismatches": language_mismatches,
         "domain_limit_ok": domain_limit_ok,
         "has_relative_dates": has_relative_dates,
     }
 
 
-def is_digest_ready(items):
-    quality = evaluate_digest_quality(items)
+def is_digest_ready(items, lang="ru"):
+    quality = evaluate_digest_quality(items, lang=lang)
     return (
         quality["item_count"] == READY_NEWS_MIN_ITEMS
         and quality["domains"] >= 3
         and quality["urls"] == READY_NEWS_MIN_ITEMS
+        and quality["language_mismatches"] == 0
         and quality["domain_limit_ok"]
         and not quality["has_relative_dates"]
     )
@@ -2054,12 +2061,44 @@ def row_to_digest_item(row):
     return normalized
 
 
+def repair_digest_language(items, lang, persist=False):
+    mismatch_count = count_digest_language_mismatches(items, lang)
+    if not mismatch_count:
+        return items
+
+    logger.warning(
+        "Repairing digest item language lang=%s mismatches=%s persist=%s",
+        lang,
+        mismatch_count,
+        persist,
+    )
+    translated_items = translate_digest_items(items, lang)
+    translated_items = dedupe_digest_items(translated_items)
+    remaining_mismatches = count_digest_language_mismatches(translated_items, lang)
+
+    if remaining_mismatches:
+        logger.error(
+            "Digest language repair incomplete lang=%s before=%s after=%s",
+            lang,
+            mismatch_count,
+            remaining_mismatches,
+        )
+        return []
+
+    if persist:
+        for item in translated_items:
+            upsert_news_pool_item(lang, item)
+
+    return translated_items
+
+
 def get_active_news_digest(lang):
     try:
         rows = get_news_pool_rows(lang, active_only=True)
         items = [row_to_digest_item(row) for row in rows]
         items = [item for item in items if item]
         items = dedupe_digest_items(items)
+        items = repair_digest_language(items, lang, persist=True)
         if not items:
             return None
 
@@ -2148,6 +2187,7 @@ def render_news_digest_snapshot(row, lang):
         normalized_items = [normalize_digest_item(item) for item in items]
         normalized_items = [item for item in normalized_items if item]
         normalized_items = dedupe_digest_items(normalized_items)
+        normalized_items = repair_digest_language(normalized_items, lang)
         if normalized_items:
             return render_news_digest_html(normalized_items, lang)
 
@@ -2235,9 +2275,9 @@ def refresh_news_digest(lang="ru", force=False, chat_id=None):
     for item in final_items:
         upsert_news_pool_item(lang, item)
 
-    quality = evaluate_digest_quality(final_items)
+    quality = evaluate_digest_quality(final_items, lang=lang)
 
-    if is_digest_ready(final_items):
+    if is_digest_ready(final_items, lang=lang):
         set_active_news_pool_items(
             lang,
             [item["source_url"] for item in final_items if item.get("source_url")],
@@ -2259,6 +2299,7 @@ def refresh_news_digest(lang="ru", force=False, chat_id=None):
                 "item_count": len(final_items),
                 "domains": quality["domains"],
                 "urls": quality["urls"],
+                "language_mismatches": quality["language_mismatches"],
                 "reason": "save_ready_digest_failed",
             }
         return {
@@ -2268,6 +2309,7 @@ def refresh_news_digest(lang="ru", force=False, chat_id=None):
             "item_count": len(final_items),
             "domains": quality["domains"],
             "urls": quality["urls"],
+            "language_mismatches": quality["language_mismatches"],
             "digest_id": digest_id,
         }
 
@@ -2279,6 +2321,7 @@ def refresh_news_digest(lang="ru", force=False, chat_id=None):
             "item_count": quality["item_count"],
             "domains": quality["domains"],
             "urls": quality["urls"],
+            "language_mismatches": quality["language_mismatches"],
         }
 
     digest_id = save_news_digest(
@@ -2296,6 +2339,7 @@ def refresh_news_digest(lang="ru", force=False, chat_id=None):
         "item_count": quality["item_count"],
         "domains": quality["domains"],
         "urls": quality["urls"],
+        "language_mismatches": quality["language_mismatches"],
         "digest_id": digest_id,
     }
 
@@ -2663,7 +2707,8 @@ def process_news_refresh_request(chat_id, lang, trigger_text, force=False):
                     f"Статус: {result['status']}\n"
                     f"Новых новостей: {result.get('new_count', 0)}\n"
                     f"Пунктов в подборке: {result.get('item_count', 0)}\n"
-                    f"Доменов: {result.get('domains', 0)}"
+                    f"Доменов: {result.get('domains', 0)}\n"
+                    f"Языковых ошибок: {result.get('language_mismatches', 0)}"
                 )
             else:
                 ans = (
@@ -2671,7 +2716,8 @@ def process_news_refresh_request(chat_id, lang, trigger_text, force=False):
                     f"Status: {result['status']}\n"
                     f"New items: {result.get('new_count', 0)}\n"
                     f"Items in digest: {result.get('item_count', 0)}\n"
-                    f"Domains: {result.get('domains', 0)}"
+                    f"Domains: {result.get('domains', 0)}\n"
+                    f"Language mismatches: {result.get('language_mismatches', 0)}"
                 )
         except Exception:
             logger.exception("Unhandled error in process_news_refresh_request chat_id=%s lang=%s", chat_id, lang)
