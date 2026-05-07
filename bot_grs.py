@@ -2231,6 +2231,10 @@ def refresh_news_digest(lang="ru", force=False, chat_id=None):
     refreshed_pool_items = [row_to_digest_item(row) for row in refreshed_pool_rows]
     refreshed_pool_items = [item for item in refreshed_pool_items if item]
     final_items = merge_news_pool_items(refreshed_pool_items, [])
+    final_items = translate_digest_items(final_items, lang)
+    for item in final_items:
+        upsert_news_pool_item(lang, item)
+
     quality = evaluate_digest_quality(final_items)
 
     if is_digest_ready(final_items):
@@ -2625,6 +2629,21 @@ def make_news_job_key(chat_id, lang):
     return f"{chat_id}:{lang}"
 
 
+def is_news_job_active(chat_id, lang):
+    with active_news_jobs_lock:
+        return make_news_job_key(chat_id, lang) in active_news_jobs
+
+
+def is_news_refresh_command(text):
+    parts = (text or "").strip().split(maxsplit=1)
+    if not parts:
+        return False
+
+    command = parts[0].lower()
+    command = command.split("@", 1)[0].lstrip("/")
+    return command in {"refresh_news", "refresh_news_digest"}
+
+
 def process_news_refresh_request(chat_id, lang, trigger_text, force=False):
     job_key = make_news_job_key(chat_id, lang)
     stop_event = threading.Event()
@@ -2746,7 +2765,7 @@ def webhook():
         send_message(chat_id, t["welcome"], get_lang_keyboard())
         return "ok"
 
-    if text == "/refresh_news":
+    if is_news_refresh_command(text):
         if not is_admin_news_chat(chat_id):
             send_message(chat_id, pending_news_message(lang))
             return "ok"
@@ -2756,6 +2775,7 @@ def webhook():
             if job_key in active_news_jobs:
                 logger.info("News refresh job already active for %s", job_key)
                 print(f"News refresh job already active for {job_key}", flush=True)
+                send_message(chat_id, pending_news_message(lang))
                 return "ok"
             active_news_jobs.add(job_key)
 
@@ -2790,6 +2810,10 @@ def webhook():
         return "ok"
 
     if text in [ru_t["btn_news"], en_t["btn_news"]]:
+        if is_news_job_active(chat_id, lang):
+            send_message(chat_id, pending_news_message(lang))
+            return "ok"
+
         active_digest = get_active_news_digest(lang)
         if active_digest and active_digest.get("rendered_html"):
             send_message(
