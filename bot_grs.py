@@ -354,9 +354,21 @@ TEXTS = {
         "welcome": "Добро пожаловать в GRS Bot! 🌍\nПожалуйста, выберите язык:",
         "menu_title": "Главное меню:",
         "btn_news": "📰 Актуальные новости",
+        "btn_help": "ℹ️ Как пользоваться",
         "btn_contact": "📝 Написать менеджеру",
         "btn_limit": "📊 Проверить лимит",
-        "contact_info": "Связаться с менеджером GRS: @globalrelocationsolutions_cz\nБоты и автоматизация: @kovachinfo",
+        "help_info": (
+            "ℹ️ Как пользоваться\n\n"
+            "Задайте вопрос свободной формы о визах, ВНЖ, ПМЖ, гражданстве, въезде, документах или релокации.\n\n"
+            "📰 Актуальные новости — подборка важных миграционных новостей из разных источников.\n\n"
+            "📝 Написать менеджеру — контакты команды GRS.\n\n"
+            "🎙 Скоро можно будет отправлять аудиосообщения: бот расшифрует голос и ответит по смыслу."
+        ),
+        "contact_info": (
+            "Связаться с менеджером GRS: @globalrelocationsolutions_cz\n"
+            "Почта: mail@globalrelocation.info\n"
+            "Боты и автоматизация: @kovachinfo"
+        ),
         "limit_info": "Использовано запросов: {count} из {max}.",
         "limit_reached": "🚫 Вы исчерпали лимит бесплатных запросов ({max}).\nПожалуйста, свяжитесь с менеджером для консультации: {manager_username}",
         "lang_selected": "🇷🇺 Язык установлен: Русский",
@@ -370,9 +382,21 @@ TEXTS = {
         "welcome": "Welcome to GRS Bot! 🌍\nPlease select your language:",
         "menu_title": "Main menu:",
         "btn_news": "📰 Latest News",
+        "btn_help": "ℹ️ How to use",
         "btn_contact": "📝 Contact Manager",
         "btn_limit": "📊 Check Limit",
-        "contact_info": "Contact GRS manager: @globalrelocationsolutions_cz\nBots & automation: @kovachinfo",
+        "help_info": (
+            "ℹ️ How to use\n\n"
+            "Ask a free-form question about visas, residence permits, citizenship, entry rules, documents, or relocation.\n\n"
+            "📰 Latest News — a curated digest of important migration news from multiple sources.\n\n"
+            "📝 Contact Manager — GRS team contacts.\n\n"
+            "🎙 Voice messages are coming soon: the bot will transcribe audio and answer the question."
+        ),
+        "contact_info": (
+            "Contact GRS manager: @globalrelocationsolutions_cz\n"
+            "Email: mail@globalrelocation.info\n"
+            "Bots & automation: @kovachinfo"
+        ),
         "limit_info": "Requests used: {count} of {max}.",
         "limit_reached": "🚫 You have reached the free request limit ({max}).\nPlease contact the manager: {manager_username}",
         "lang_selected": "🇬🇧 Language set: English",
@@ -2176,20 +2200,10 @@ def render_news_digest_snapshot(row, lang):
     if not row:
         return ""
 
-    items = row.get("items_json") or []
-    if isinstance(items, str):
-        try:
-            items = json.loads(items)
-        except json.JSONDecodeError:
-            items = []
-
-    if isinstance(items, list):
-        normalized_items = [normalize_digest_item(item) for item in items]
-        normalized_items = [item for item in normalized_items if item]
-        normalized_items = dedupe_digest_items(normalized_items)
-        normalized_items = repair_digest_language(normalized_items, lang)
-        if normalized_items:
-            return render_news_digest_html(normalized_items, lang)
+    normalized_items = normalize_snapshot_items(row)
+    normalized_items = repair_digest_language(normalized_items, lang)
+    if normalized_items:
+        return render_news_digest_html(normalized_items, lang)
 
     return row.get("rendered_html") or ""
 
@@ -2688,6 +2702,102 @@ def is_news_refresh_command(text):
     return command in {"refresh_news", "refresh_news_digest"}
 
 
+def is_news_status_command(text):
+    parts = (text or "").strip().split(maxsplit=1)
+    if not parts:
+        return False
+
+    command = parts[0].lower()
+    command = command.split("@", 1)[0].lstrip("/")
+    return command in {"news_status", "digest_status", "status_news"}
+
+
+def normalize_snapshot_items(row):
+    items = row.get("items_json") if row else []
+    if isinstance(items, str):
+        try:
+            items = json.loads(items)
+        except json.JSONDecodeError:
+            items = []
+
+    if not isinstance(items, list):
+        return []
+
+    normalized_items = [normalize_digest_item(item) for item in items]
+    normalized_items = [item for item in normalized_items if item]
+    return dedupe_digest_items(normalized_items)
+
+
+def format_digest_age(age_sec, lang):
+    if age_sec is None:
+        return "нет данных" if lang == "ru" else "unknown"
+
+    minutes = int(age_sec // 60)
+    if minutes < 90:
+        return f"{minutes} мин." if lang == "ru" else f"{minutes} min"
+
+    hours = age_sec / 3600
+    return f"{hours:.1f} ч." if lang == "ru" else f"{hours:.1f} h"
+
+
+def check_database_health():
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
+        return True
+    except Exception as exc:
+        logger.error("Database health check failed: %s", exc)
+        return False
+
+
+def get_news_digest_status(lang, chat_id=None):
+    db_ok = check_database_health()
+    active_rows = get_news_pool_rows(lang, active_only=True)
+    active_items = [row_to_digest_item(row) for row in active_rows]
+    active_items = [item for item in active_items if item]
+    active_items = dedupe_digest_items(active_items)
+    active_quality = evaluate_digest_quality(active_items, lang=lang)
+
+    ready_digest = get_latest_news_digest(lang, allow_stale=True)
+    ready_items = normalize_snapshot_items(ready_digest)
+    ready_quality = evaluate_digest_quality(ready_items, lang=lang)
+    ready_age_sec = ready_digest.get("age_sec") if ready_digest else None
+    ready_created_at = ready_digest.get("created_at") if ready_digest else None
+
+    if lang == "ru":
+        ready_time = ready_created_at.isoformat() if ready_created_at else "нет"
+        return (
+            "🧪 Статус новостного дайджеста\n\n"
+            f"Язык: {lang}\n"
+            f"База данных: {'ok' if db_ok else 'ошибка'}\n"
+            f"Обновление сейчас: {'да' if chat_id and is_news_job_active(chat_id, lang) else 'нет'}\n\n"
+            f"Активный pool: {active_quality['item_count']} пунктов, "
+            f"{active_quality['domains']} доменов, "
+            f"языковых ошибок: {active_quality['language_mismatches']}\n"
+            f"Ready snapshot: {ready_quality['item_count']} пунктов, "
+            f"языковых ошибок: {ready_quality['language_mismatches']}\n"
+            f"Возраст snapshot: {format_digest_age(ready_age_sec, lang)}\n"
+            f"Создан: {ready_time}"
+        )
+
+    ready_time = ready_created_at.isoformat() if ready_created_at else "none"
+    return (
+        "🧪 News digest status\n\n"
+        f"Language: {lang}\n"
+        f"Database: {'ok' if db_ok else 'error'}\n"
+        f"Refresh active: {'yes' if chat_id and is_news_job_active(chat_id, lang) else 'no'}\n\n"
+        f"Active pool: {active_quality['item_count']} items, "
+        f"{active_quality['domains']} domains, "
+        f"language mismatches: {active_quality['language_mismatches']}\n"
+        f"Ready snapshot: {ready_quality['item_count']} items, "
+        f"language mismatches: {ready_quality['language_mismatches']}\n"
+        f"Snapshot age: {format_digest_age(ready_age_sec, lang)}\n"
+        f"Created: {ready_time}"
+    )
+
+
 def process_news_refresh_request(chat_id, lang, trigger_text, force=False):
     job_key = make_news_job_key(chat_id, lang)
     stop_event = threading.Event()
@@ -2735,8 +2845,8 @@ def get_main_keyboard(lang):
     t = TEXTS[lang]
     return {
         "keyboard": [
-            [{"text": t["btn_news"]}, {"text": t["btn_contact"]}],
-            [{"text": t["btn_limit"]}]
+            [{"text": t["btn_news"]}, {"text": t["btn_help"]}],
+            [{"text": t["btn_contact"]}, {"text": t["btn_limit"]}]
         ],
         "resize_keyboard": True
     }
@@ -2834,6 +2944,14 @@ def webhook():
         worker.start()
         return "ok"
 
+    if is_news_status_command(text):
+        if not is_admin_news_chat(chat_id):
+            send_message(chat_id, pending_news_message(lang))
+            return "ok"
+
+        send_message(chat_id, get_news_digest_status(lang, chat_id=chat_id))
+        return "ok"
+
     # Смена языка
     if text == TEXTS["ru"]["btn_ru"] or text == "🇷🇺 Русский":
         update_user_language(chat_id, "ru")
@@ -2848,6 +2966,10 @@ def webhook():
     # Кнопки меню (проверяем оба языка, чтобы избежать рассинхрона)
     if text in [ru_t["btn_contact"], en_t["btn_contact"]]:
         send_message(chat_id, t["contact_info"])
+        return "ok"
+
+    if text in [ru_t["btn_help"], en_t["btn_help"]]:
+        send_message(chat_id, t["help_info"])
         return "ok"
     
     if text in [ru_t["btn_limit"], en_t["btn_limit"]]:
