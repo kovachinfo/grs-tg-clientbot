@@ -1709,6 +1709,10 @@ def is_generic_digest_source_url(source_url):
     return False
 
 
+def count_generic_digest_source_urls(items):
+    return sum(1 for item in items if is_generic_digest_source_url(item.get("source_url", "")))
+
+
 def looks_like_evergreen_digest_item(title, summary):
     title_lower = (title or "").lower()
     summary_lower = (summary or "").lower()
@@ -2027,6 +2031,7 @@ def dedupe_digest_items(items):
 def evaluate_digest_quality(items, lang="ru"):
     domains = {item.get("source_domain") for item in items if item.get("source_domain")}
     urls = sum(1 for item in items if item.get("source_url"))
+    generic_urls = count_generic_digest_source_urls(items)
     language_mismatches = count_digest_language_mismatches(items, lang)
     domain_limit_ok = all(
         sum(1 for item in items if item.get("source_domain") == domain) <= MAX_NEWS_PER_DOMAIN
@@ -2046,6 +2051,7 @@ def evaluate_digest_quality(items, lang="ru"):
         "item_count": len(items),
         "domains": len(domains),
         "urls": urls,
+        "generic_urls": generic_urls,
         "language_mismatches": language_mismatches,
         "domain_limit_ok": domain_limit_ok,
         "has_relative_dates": has_relative_dates,
@@ -2058,6 +2064,7 @@ def is_digest_ready(items, lang="ru"):
         quality["item_count"] == READY_NEWS_MIN_ITEMS
         and quality["domains"] >= 3
         and quality["urls"] == READY_NEWS_MIN_ITEMS
+        and quality["generic_urls"] == 0
         and quality["language_mismatches"] == 0
         and quality["domain_limit_ok"]
         and not quality["has_relative_dates"]
@@ -2161,7 +2168,7 @@ def render_news_digest_html(items, lang):
     )
 
     formatted = []
-    source_label = "Оригинал" if lang == "ru" else "Original"
+    source_label = "Оригинал статьи" if lang == "ru" else "Original article"
 
     for index, item in enumerate(items, start=1):
         title = escape_html(item.get("title", "").strip())
@@ -2173,11 +2180,10 @@ def render_news_digest_html(items, lang):
         url = item.get("source_url", "").strip()
 
         if url and domain:
-            source_line = f"🔗 {source_label}: <a href=\"{escape_html_attr(url)}\">{domain}</a>"
+            source_line = f"🔗 <a href=\"{escape_html_attr(url)}\">{source_label}</a>: {domain}"
         elif url:
             source_line = (
-                f"🔗 {source_label}: "
-                f"<a href=\"{escape_html_attr(url)}\">{escape_html(url)}</a>"
+                f"🔗 <a href=\"{escape_html_attr(url)}\">{source_label}</a>"
             )
         elif domain:
             source_line = f"🔗 {source_label}: {domain}"
@@ -2313,6 +2319,7 @@ def refresh_news_digest(lang="ru", force=False, chat_id=None):
                 "item_count": len(final_items),
                 "domains": quality["domains"],
                 "urls": quality["urls"],
+                "generic_urls": quality["generic_urls"],
                 "language_mismatches": quality["language_mismatches"],
                 "reason": "save_ready_digest_failed",
             }
@@ -2323,6 +2330,7 @@ def refresh_news_digest(lang="ru", force=False, chat_id=None):
             "item_count": len(final_items),
             "domains": quality["domains"],
             "urls": quality["urls"],
+            "generic_urls": quality["generic_urls"],
             "language_mismatches": quality["language_mismatches"],
             "digest_id": digest_id,
         }
@@ -2335,6 +2343,7 @@ def refresh_news_digest(lang="ru", force=False, chat_id=None):
             "item_count": quality["item_count"],
             "domains": quality["domains"],
             "urls": quality["urls"],
+            "generic_urls": quality["generic_urls"],
             "language_mismatches": quality["language_mismatches"],
         }
 
@@ -2353,6 +2362,7 @@ def refresh_news_digest(lang="ru", force=False, chat_id=None):
         "item_count": quality["item_count"],
         "domains": quality["domains"],
         "urls": quality["urls"],
+        "generic_urls": quality["generic_urls"],
         "language_mismatches": quality["language_mismatches"],
         "digest_id": digest_id,
     }
@@ -2775,8 +2785,10 @@ def get_news_digest_status(lang, chat_id=None):
             f"Обновление сейчас: {'да' if chat_id and is_news_job_active(chat_id, lang) else 'нет'}\n\n"
             f"Активный pool: {active_quality['item_count']} пунктов, "
             f"{active_quality['domains']} доменов, "
+            f"неоригинальных URL: {active_quality['generic_urls']}, "
             f"языковых ошибок: {active_quality['language_mismatches']}\n"
             f"Ready snapshot: {ready_quality['item_count']} пунктов, "
+            f"неоригинальных URL: {ready_quality['generic_urls']}, "
             f"языковых ошибок: {ready_quality['language_mismatches']}\n"
             f"Возраст snapshot: {format_digest_age(ready_age_sec, lang)}\n"
             f"Создан: {ready_time}"
@@ -2790,8 +2802,10 @@ def get_news_digest_status(lang, chat_id=None):
         f"Refresh active: {'yes' if chat_id and is_news_job_active(chat_id, lang) else 'no'}\n\n"
         f"Active pool: {active_quality['item_count']} items, "
         f"{active_quality['domains']} domains, "
+        f"generic URLs: {active_quality['generic_urls']}, "
         f"language mismatches: {active_quality['language_mismatches']}\n"
         f"Ready snapshot: {ready_quality['item_count']} items, "
+        f"generic URLs: {ready_quality['generic_urls']}, "
         f"language mismatches: {ready_quality['language_mismatches']}\n"
         f"Snapshot age: {format_digest_age(ready_age_sec, lang)}\n"
         f"Created: {ready_time}"
@@ -2818,6 +2832,7 @@ def process_news_refresh_request(chat_id, lang, trigger_text, force=False):
                     f"Новых новостей: {result.get('new_count', 0)}\n"
                     f"Пунктов в подборке: {result.get('item_count', 0)}\n"
                     f"Доменов: {result.get('domains', 0)}\n"
+                    f"Неоригинальных URL: {result.get('generic_urls', 0)}\n"
                     f"Языковых ошибок: {result.get('language_mismatches', 0)}"
                 )
             else:
@@ -2827,6 +2842,7 @@ def process_news_refresh_request(chat_id, lang, trigger_text, force=False):
                     f"New items: {result.get('new_count', 0)}\n"
                     f"Items in digest: {result.get('item_count', 0)}\n"
                     f"Domains: {result.get('domains', 0)}\n"
+                    f"Generic URLs: {result.get('generic_urls', 0)}\n"
                     f"Language mismatches: {result.get('language_mismatches', 0)}"
                 )
         except Exception:
