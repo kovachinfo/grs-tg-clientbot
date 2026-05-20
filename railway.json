@@ -1,0 +1,6 @@
+{
+  "$schema": "https://railway.com/railway.schema.json",
+  "deploy": {
+    "startCommand": "gunicorn --bind 0.0.0.0:$PORT bot_grs:app"
+  }
+}

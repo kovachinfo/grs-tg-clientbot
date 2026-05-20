@@ -1,0 +1,11 @@
+.git
+.agents
+.codex
+.env
+__pycache__
+*.pyc
+.venv
+venv
+node_modules
+*.png
+*.pdf
