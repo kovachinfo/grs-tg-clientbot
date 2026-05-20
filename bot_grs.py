@@ -91,6 +91,17 @@ def get_int_env(name, default):
 NEWS_LOOKBACK_DAYS = get_int_env("NEWS_LOOKBACK_DAYS", 120)
 NEWS_ALLOWED_DOMAINS_RAW = os.getenv("NEWS_ALLOWED_DOMAINS", "")
 NEWS_SOURCE_URLS_RAW = os.getenv("NEWS_SOURCE_URLS", "")
+NEWS_LOW_PRIORITY_DOMAINS_RAW = os.getenv("NEWS_LOW_PRIORITY_DOMAINS", "")
+
+DEFAULT_LOW_PRIORITY_NEWS_DOMAINS = {
+    "astons.com",
+    "confidencegroup.ru",
+    "espassport.pro",
+    "immigrantinvest.com",
+    "iworld.com",
+    "passportivity.com",
+    "visa-digital-nomad.com",
+}
 
 DEFAULT_NEWS_SOURCE_PROFILES = [
     {
@@ -518,6 +529,23 @@ def get_allowed_news_domains():
     return unique
 
 
+def get_low_priority_news_domains():
+    domains = []
+
+    if NEWS_LOW_PRIORITY_DOMAINS_RAW.strip():
+        for item in parse_config_list(NEWS_LOW_PRIORITY_DOMAINS_RAW):
+            domains.extend(normalize_domain(item))
+    else:
+        domains.extend(DEFAULT_LOW_PRIORITY_NEWS_DOMAINS)
+
+    return {comparable_domain(domain) for domain in domains if comparable_domain(domain)}
+
+
+def is_low_priority_news_domain(value):
+    domain = comparable_domain(value)
+    return bool(domain and domain in get_low_priority_news_domains())
+
+
 def build_source_profile_prompt(lang, compact=False):
     profiles = get_news_source_profiles()
     lines = []
@@ -635,6 +663,7 @@ def build_news_snapshot_prompt(lang):
     today = datetime.now(timezone.utc).date()
     start_date = today - timedelta(days=NEWS_LOOKBACK_DAYS)
     allowed_domains = get_allowed_news_domains()
+    low_priority_domains = sorted(get_low_priority_news_domains())
     source_profiles = build_source_profile_prompt(lang, compact=True)
 
     if lang == "ru":
@@ -643,12 +672,21 @@ def build_news_snapshot_prompt(lang):
             if allowed_domains else
             "Используй несколько независимых источников. "
         )
+        priority_rule = (
+            "Источники консультационных/сервисных компаний используй только после независимых медиа и официальных источников; "
+            "не больше 1-2 таких материалов в финальной подборке, если есть сильные альтернативы. "
+            f"Низкий приоритет: {', '.join(low_priority_domains)}. "
+            if low_priority_domains else
+            ""
+        )
         return (
             f"Найди {CANDIDATE_NEWS_ITEMS - 2}-{CANDIDATE_NEWS_ITEMS} кандидатов для новостного дайджеста релокантов из России за период "
             f"с {start_date.isoformat()} по {today.isoformat()}. "
             "Темы: визы, ВНЖ/ПМЖ, гражданство, правила въезда, трудовая и учебная миграция, digital nomad, "
             "воссоединение семьи, легализация, консульские ограничения. "
             "Приоритет: разные страны и разные домены; не больше 2 новостей с одного домена, если есть альтернатива. "
+            + priority_rule
+            +
             "Не включай общие гайды, обзоры услуг, внутренние новости РФ без прямого влияния на релокацию, спорт, криминал, вакансии. "
             + domain_rule
             + "Если точной статьи нет, не придумывай ее. Нужна только оригинальная статья, а не главная страница сайта. "
@@ -671,12 +709,21 @@ def build_news_snapshot_prompt(lang):
         if allowed_domains else
         "Use several independent sources. "
     )
+    priority_rule = (
+        "Use consulting/service-company sources only after independent media and official sources; "
+        "use no more than 1-2 such items in the final digest when strong alternatives exist. "
+        f"Low priority: {', '.join(low_priority_domains)}. "
+        if low_priority_domains else
+        ""
+    )
     return (
         f"Find {CANDIDATE_NEWS_ITEMS - 2}-{CANDIDATE_NEWS_ITEMS} candidate news items for a Russian relocator digest from "
         f"{start_date.isoformat()} to {today.isoformat()}. "
         "Topics: visas, residence permits, citizenship, entry rules, work and study migration, digital nomads, "
         "family reunion, legalization, consular restrictions. Prioritize different countries and different domains; "
         "avoid more than 2 items from one domain if alternatives exist. "
+        + priority_rule
+        +
         "Exclude generic guides, service pages, Russia-only domestic news without relocation impact, sports, crime, vacancies. "
         + domain_rule
         + "If there is no exact article, do not invent it. Only original article URLs, not site homepages. "
@@ -1651,6 +1698,16 @@ def cleanup_digest_text(value):
     return text
 
 
+def cleanup_digest_title(value):
+    text = cleanup_digest_text(value)
+    if not text:
+        return ""
+
+    # Model/search snippets sometimes leave a broken final fragment, e.g. "номадом ву".
+    text = re.sub(r"\s+\b[а-яё]{1,2}\b$", "", text).strip(" \n\t-—,;.")
+    return cleanup_digest_text(text)
+
+
 def strip_digest_source_artifacts(value, source_domain="", source_url=""):
     if not value:
         return ""
@@ -1775,7 +1832,7 @@ def normalize_digest_item(item):
     title = strip_digest_source_artifacts(title, source_domain, source_url)
     summary = strip_digest_source_artifacts(summary, source_domain, source_url)
 
-    title = cleanup_digest_text(title)
+    title = cleanup_digest_title(title)
     date = cleanup_digest_text(date)
     title_needs_country_context = bool(
         title and (
@@ -1996,9 +2053,10 @@ def dedupe_digest_items(items):
 
     def sort_key(item):
         article_date = item.get("article_date")
+        source_priority = 1 if is_low_priority_news_domain(item.get("source_domain", "")) else 0
         if article_date:
-            return (0, -article_date.toordinal(), item.get("source_url", ""))
-        return (1, 0, item.get("source_url", ""))
+            return (source_priority, 0, -article_date.toordinal(), item.get("source_url", ""))
+        return (source_priority, 1, 0, item.get("source_url", ""))
 
     for item in sorted(items, key=sort_key):
         source_url = item.get("source_url", "")
