@@ -72,6 +72,29 @@ TARGET_NEWS_ITEMS = 10
 CANDIDATE_NEWS_ITEMS = 16
 MAX_NEWS_PER_DOMAIN = 2
 READY_NEWS_MIN_ITEMS = 10
+DIGEST_NEAR_DUPLICATE_MIN_SHARED_TOKENS = 5
+
+DIGEST_DEDUPE_STOPWORDS = {
+    "about", "after", "also", "and", "are", "from", "have", "into", "that", "the",
+    "this", "will", "with", "без", "более", "будет", "будут", "был", "была",
+    "были", "для", "его", "или", "как", "когда", "которые", "который", "лет",
+    "над", "нее", "них", "новая", "новое", "новости", "новость", "однако",
+    "они", "оно", "при", "про", "свое", "свою", "свои", "также", "уже", "что",
+    "это", "этого", "этой", "этот",
+    "января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа",
+    "сентября", "октября", "ноября", "декабря",
+    "january", "february", "march", "april", "may", "june", "july", "august",
+    "september", "october", "november", "december",
+}
+
+RU_DIGEST_MONTH_NAMES = (
+    "января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|"
+    "ноября|декабря"
+)
+EN_DIGEST_MONTH_NAMES = (
+    "january|february|march|april|may|june|july|august|september|october|"
+    "november|december"
+)
 
 processed_updates = {}
 processed_updates_lock = threading.Lock()
@@ -685,6 +708,7 @@ def build_news_snapshot_prompt(lang):
             "Темы: визы, ВНЖ/ПМЖ, гражданство, правила въезда, трудовая и учебная миграция, digital nomad, "
             "воссоединение семьи, легализация, консульские ограничения. "
             "Приоритет: разные страны и разные домены; не больше 2 новостей с одного домена, если есть альтернатива. "
+            "Не включай две статьи об одном и том же событии или изменении, даже если заголовки отличаются. "
             + priority_rule
             +
             "Не включай общие гайды, обзоры услуг, внутренние новости РФ без прямого влияния на релокацию, спорт, криминал, вакансии. "
@@ -722,6 +746,7 @@ def build_news_snapshot_prompt(lang):
         "Topics: visas, residence permits, citizenship, entry rules, work and study migration, digital nomads, "
         "family reunion, legalization, consular restrictions. Prioritize different countries and different domains; "
         "avoid more than 2 items from one domain if alternatives exist. "
+        "Do not include two articles about the same event or policy change, even when their titles differ. "
         + priority_rule
         +
         "Exclude generic guides, service pages, Russia-only domestic news without relocation impact, sports, crime, vacancies. "
@@ -1177,6 +1202,111 @@ def normalize_news_item_key(item_text):
     title = re.sub(r"\s+", " ", title).strip()
     words = title.split()
     return " ".join(words[:12])
+
+
+def normalize_digest_source_url_key(source_url):
+    if not source_url:
+        return ""
+
+    try:
+        parsed = urlparse(source_url)
+    except Exception:
+        return source_url.strip().lower()
+
+    host = normalize_host(source_url)
+    path = re.sub(r"/+$", "", parsed.path or "/").lower()
+    return f"{host}{path}"
+
+
+def normalize_digest_dedupe_token(token):
+    token = token.lower().replace("ё", "е")
+    if not token or token.isdigit():
+        return ""
+
+    synonyms = {
+        "рф": "россия",
+        "россии": "россия",
+        "россию": "россия",
+        "россией": "россия",
+        "russia": "россия",
+        "russian": "россия",
+    }
+    token = synonyms.get(token, token)
+
+    if len(token) < 4 or token in DIGEST_DEDUPE_STOPWORDS:
+        return ""
+
+    russian_suffixes = (
+        "иями", "ями", "ами", "его", "ого", "ему", "ому", "ыми", "ими",
+        "ией", "иях", "ость", "ости", "ение", "ения", "ов", "ев", "ей",
+        "ия", "ие", "ий", "ый", "ой", "ая", "ое", "ые", "ых", "их",
+        "ам", "ям", "ом", "ем", "ах", "ях", "ью", "а", "я", "ы", "и",
+        "е", "о", "у", "ю",
+    )
+    english_suffixes = ("ization", "isation", "ments", "ment", "ing", "ed", "es", "s")
+
+    suffixes = russian_suffixes if re.search(r"[а-я]", token) else english_suffixes
+    for suffix in suffixes:
+        if token.endswith(suffix) and len(token) > len(suffix) + 4:
+            token = token[: -len(suffix)]
+            break
+
+    if len(token) < 4 or token in DIGEST_DEDUPE_STOPWORDS:
+        return ""
+    return token
+
+
+def get_digest_dedupe_tokens(item):
+    text = " ".join(
+        str(item.get(field, "") or "")
+        for field in ["country", "title", "summary"]
+    )
+    tokens = set()
+    for raw_token in re.findall(r"[a-zа-яё0-9]+", text.lower(), flags=re.I):
+        token = normalize_digest_dedupe_token(raw_token)
+        if token:
+            tokens.add(token)
+    return tokens
+
+
+def get_digest_article_date_key(item):
+    article_date = item.get("article_date")
+    if isinstance(article_date, datetime):
+        article_date = article_date.date()
+    if isinstance(article_date, date):
+        return article_date.isoformat()
+
+    parsed = parse_article_date(str(item.get("date", "") or ""))
+    return parsed.isoformat() if parsed else ""
+
+
+def are_near_duplicate_digest_items(item, existing_item):
+    item_tokens = get_digest_dedupe_tokens(item)
+    existing_tokens = get_digest_dedupe_tokens(existing_item)
+    if not item_tokens or not existing_tokens:
+        return False
+
+    shared_count = len(item_tokens & existing_tokens)
+    if shared_count < DIGEST_NEAR_DUPLICATE_MIN_SHARED_TOKENS:
+        return False
+
+    union_count = len(item_tokens | existing_tokens)
+    similarity = shared_count / union_count if union_count else 0
+    containment = shared_count / min(len(item_tokens), len(existing_tokens))
+    item_domain = comparable_domain(item.get("source_domain"))
+    existing_domain = comparable_domain(existing_item.get("source_domain"))
+    item_date = get_digest_article_date_key(item)
+    existing_date = get_digest_article_date_key(existing_item)
+    same_domain = bool(item_domain and item_domain == existing_domain)
+    same_date = bool(item_date and item_date == existing_date)
+
+    if same_domain and same_date:
+        return similarity >= 0.34 or containment >= 0.55
+    if same_domain:
+        return similarity >= 0.46 or containment >= 0.68
+    if same_date:
+        return similarity >= 0.55 or containment >= 0.72
+    return similarity >= 0.68 and containment >= 0.78
 
 
 def extract_news_item_domain(item_text):
@@ -1687,6 +1817,13 @@ def cleanup_digest_text(value):
         return ""
 
     text = sanitize_plain_text(str(value), preserve_urls=True)
+    text = re.sub(
+        rf"\b(\d{{1,2}}\s+(?:{RU_DIGEST_MONTH_NAMES}|{EN_DIGEST_MONTH_NAMES}))(?=[A-ZА-ЯЁ])",
+        r"\1 ",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(r"\b(20\d{2})(?=[A-ZА-ЯЁ])", r"\1 ", text)
     text = re.sub(r"\b(\d{4})\s*[–-]\s*ы\b", r"\1", text, flags=re.I)
     text = re.sub(r"\b(\d{4})\s*[–-](?!\d)", r"\1", text)
     text = re.sub(r"\b(\d{4})\s*[–-]\s*\.", r"\1.", text)
@@ -2060,22 +2197,25 @@ def dedupe_digest_items(items):
 
     for item in sorted(items, key=sort_key):
         source_url = item.get("source_url", "")
+        source_url_key = normalize_digest_source_url_key(source_url)
         fallback_key = item.get("normalized_title_key") or normalize_news_item_key(
             f"{item.get('source_domain', '')} {item.get('title', '')}"
         )
-        if not source_url and not fallback_key:
+        if not source_url_key and not fallback_key:
             continue
-        if source_url and source_url in seen_urls:
+        if source_url_key and source_url_key in seen_urls:
             continue
         if fallback_key and fallback_key in seen_fallback:
+            continue
+        if any(are_near_duplicate_digest_items(item, existing) for existing in deduped):
             continue
 
         domain = item.get("source_domain", "").strip().lower()
         if domain and domain_counts.get(domain, 0) >= MAX_NEWS_PER_DOMAIN:
             continue
 
-        if source_url:
-            seen_urls.add(source_url)
+        if source_url_key:
+            seen_urls.add(source_url_key)
         if fallback_key:
             seen_fallback.add(fallback_key)
         if domain:
